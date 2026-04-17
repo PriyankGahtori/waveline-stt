@@ -1,0 +1,44 @@
+{
+  "manifest_version": 3,
+  "name": "Waveline",
+  "version": "0.3.0",
+  "description": "Local, private speech-to-text transcription using Whisper or Voxtral. Zero data loss.",
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Waveline",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "permissions": [
+    "tabCapture",
+    "activeTab",
+    "storage",
+    "downloads",
+    "scripting",
+    "offscreen"
+  ],
+  "host_permissions": [
+    "http://localhost/*",
+    "https://localhost/*",
+    "http://127.0.0.1/*",
+    "https://127.0.0.1/*",
+    "<all_urls>"
+  ],
+  "background": {
+    "service_worker": "service_worker.js"
+  },
+  "web_accessible_resources": [
+    {
+      "resources": ["pcm-worklet.js"],
+      "matches": ["<all_urls>"]
+    }
+  ]
+}
