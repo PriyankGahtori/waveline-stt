@@ -1,22 +1,28 @@
 // popup.js — UI layer. All recording happens in offscreen.js via service_worker.js.
 
-const startBtn    = document.getElementById('startBtn');
-const stopBtn     = document.getElementById('stopBtn');
-const clearBtn    = document.getElementById('clearBtn');
-const exportBtn   = document.getElementById('exportBtn');
-const includeMic  = document.getElementById('includeMic');
-const notesEl     = document.getElementById('notes');
-const statusEl    = document.getElementById('status');
-const modelSelect = document.getElementById('modelSelect');
-const connStatus  = document.getElementById('connStatus');
-const connText    = document.getElementById('connText');
-const deadWarning = document.getElementById('deadWarning');
+const startBtn        = document.getElementById('startBtn');
+const stopBtn         = document.getElementById('stopBtn');
+const clearBtn        = document.getElementById('clearBtn');
+const exportBtn       = document.getElementById('exportBtn');
+const micBtn          = document.getElementById('micBtn');
+const notesEl         = document.getElementById('notes');
+const statusEl        = document.getElementById('status');
+const modelSelect     = document.getElementById('modelSelect');
+const connStatus      = document.getElementById('connStatus');
+const connText        = document.getElementById('connText');
+const deadWarning     = document.getElementById('deadWarning');
 const deadWarningText = document.getElementById('deadWarningText');
-const charCount   = document.getElementById('charCount');
-const themeToggle = document.getElementById('themeToggle');
-const iconSun     = document.getElementById('iconSun');
-const iconMoon    = document.getElementById('iconMoon');
-const waveformEl  = document.getElementById('waveform');
+const charCount       = document.getElementById('charCount');
+const themeToggle     = document.getElementById('themeToggle');
+const iconSun         = document.getElementById('iconSun');
+const iconMoon        = document.getElementById('iconMoon');
+const waveformEl      = document.getElementById('waveform');
+const sourceIndicators = document.getElementById('sourceIndicators');
+const optionsRow      = document.getElementById('optionsRow');
+const tabChip         = document.getElementById('tabChip');
+const micChip         = document.getElementById('micChip');
+
+let micEnabled = false;
 
 // ── Theme ────────────────────────────────────────────────────────────────────
 
@@ -50,7 +56,8 @@ chrome.runtime.sendMessage({ type: 'GET_STATE' }, (res) => {
   if (chrome.runtime.lastError) return;
   notesEl.value = res.notes || '';
   updateCharCount();
-  setUI(res.recording);
+  // We don't know mic state on reopen — show tab-only indicator if recording
+  setUI(!!res.recording, false);
 });
 
 chrome.storage.local.get(['waveline_model'], (res) => {
@@ -70,6 +77,18 @@ chrome.runtime.onMessage.addListener((msg) => {
   if (msg.type === 'CHUNK_DEAD') {
     deadWarningText.textContent = `Chunk #${msg.seq} permanently failed — gap in transcript.`;
     deadWarning.style.display = 'flex';
+  }
+  if (msg.type === 'SESSION_LOST') {
+    setUI(false, false);
+    setStatus('Session lost — server restarted. Start a new recording.', 'error');
+  }
+  if (msg.type === 'MIC_STATUS') {
+    if (msg.granted) {
+      setStatus('Recording · mic active', 'ok');
+    } else {
+      const reason = msg.reason === 'NotAllowedError' ? 'Mic permission denied' : 'Mic unavailable';
+      setStatus(`${reason} — tab audio only`, 'error');
+    }
   }
 });
 
@@ -105,6 +124,7 @@ if (modelSelect) {
     chrome.storage.local.set({ waveline_model: modelSelect.value });
   });
 }
+
 
 // ── Connection health check ───────────────────────────────────────────────────
 
@@ -144,23 +164,32 @@ const saveNotes = debounce(() => {
 }, 300);
 notesEl.addEventListener('input', saveNotes);
 
+// ── Mic button ───────────────────────────────────────────────────────────────
+
+micBtn.addEventListener('click', () => {
+  micEnabled = !micEnabled;
+  micBtn.classList.toggle('active', micEnabled);
+  micBtn.setAttribute('aria-pressed', String(micEnabled));
+  if (!micEnabled) setStatus('');
+});
+
 // ── Buttons ──────────────────────────────────────────────────────────────────
 
 startBtn.addEventListener('click', async () => {
   if (deadWarning) deadWarning.style.display = 'none';
-  setUI(true);
-  setStatus('Starting…');
+
+  const useMic = micEnabled;
+  setUI(true, useMic);
+  setStatus(useMic ? 'Requesting mic permission…' : 'Starting…');
   const model = modelSelect ? modelSelect.value : 'whisper';
   chrome.runtime.sendMessage(
-    { type: 'START_RECORDING', includeMic: includeMic.checked, model },
+    { type: 'START_RECORDING', includeMic: useMic, model },
     (res) => {
       if (res?.error) {
         setStatus('Error: ' + res.error, 'error');
-        setUI(false);
+        setUI(false, false);
       } else {
-        setStatus('Recording');
-        waveformEl.classList.add('active');
-        document.getElementById('recIndicator').classList.add('active');
+        setStatus('');
       }
     }
   );
@@ -168,10 +197,8 @@ startBtn.addEventListener('click', async () => {
 
 stopBtn.addEventListener('click', () => {
   setStatus('Stopping…');
-  waveformEl.classList.remove('active');
-  document.getElementById('recIndicator').classList.remove('active');
   chrome.runtime.sendMessage({ type: 'STOP_RECORDING' }, () => {
-    setUI(false);
+    setUI(false, false);
     setStatus('Stopped.');
   });
 });
@@ -190,14 +217,35 @@ exportBtn.addEventListener('click', () => {
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
-function setUI(isRecording) {
-  startBtn.disabled   = isRecording;
-  stopBtn.disabled    = !isRecording;
-  includeMic.disabled = isRecording;
+function setUI(isRecording, useMic) {
+  startBtn.disabled = isRecording;
+  stopBtn.disabled  = !isRecording;
   if (modelSelect) modelSelect.disabled = isRecording;
-  if (!isRecording) {
+
+  if (isRecording) {
+    // Swap options row for source indicators
+    optionsRow.style.display = 'none';
+    sourceIndicators.style.display = 'flex';
+    tabChip.classList.add('active');
+    if (useMic) {
+      micChip.style.display = 'flex';
+      micChip.classList.add('active');
+    } else {
+      micChip.style.display = 'none';
+    }
+    waveformEl.classList.add('active');
+    document.getElementById('recIndicator').classList.add('active');
+  } else {
+    optionsRow.style.display = 'flex';
+    sourceIndicators.style.display = 'none';
+    tabChip.classList.remove('active');
+    micChip.classList.remove('active');
     waveformEl.classList.remove('active');
     document.getElementById('recIndicator').classList.remove('active');
+    // Reset mic button
+    micEnabled = false;
+    micBtn.classList.remove('active');
+    micBtn.setAttribute('aria-pressed', 'false');
   }
 }
 

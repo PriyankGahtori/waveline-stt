@@ -21,6 +21,7 @@ Environment variables:
 """
 
 import asyncio
+import concurrent.futures
 import logging
 import logging.handlers
 import os
@@ -111,11 +112,27 @@ def _transcribe_voxtral(audio_path: str) -> str:
     return result.text.strip() if hasattr(result, "text") else str(result).strip()
 
 
+# Top-level function for subprocess execution (MLX is not thread-safe; must run
+# in a separate process to avoid segfaults when called from a thread pool).
+def _voxtral_subprocess(audio_path: str, voxtral_model_id: str, max_tokens: int, temperature: float) -> str:
+    from mlx_audio.stt.utils import load as voxtral_load
+    m = voxtral_load(voxtral_model_id)
+    result = m.generate(audio_path, max_tokens=max_tokens, temperature=temperature)
+    return result.text.strip() if hasattr(result, "text") else str(result).strip()
+
+
+_voxtral_executor = concurrent.futures.ProcessPoolExecutor(max_workers=1)
+
+
 def _do_transcribe(audio_path: str, model_name: str) -> str:
     if model_name == "whisper":
         return _transcribe_whisper(audio_path)
     elif model_name == "voxtral":
-        return _transcribe_voxtral(audio_path)
+        # Run in dedicated process — MLX segfaults when called from threads
+        future = _voxtral_executor.submit(
+            _voxtral_subprocess, audio_path, _VOXTRAL_MODEL, _MAX_TOKENS, _TEMPERATURE
+        )
+        return future.result()
     raise ValueError(f"Unknown model: {model_name}")
 
 
@@ -337,9 +354,16 @@ async def transcribe(
     chunk_path = s["audio_dir"] / f"chunk_{seq:05d}.wav"
     chunk_path.write_bytes(raw)
 
-    # Transcribe
+    # Transcribe — Voxtral runs in a ProcessPoolExecutor (MLX not thread-safe)
     try:
-        text = await asyncio.get_event_loop().run_in_executor(None, _do_transcribe, str(chunk_path), model)
+        loop = asyncio.get_event_loop()
+        if model == "voxtral":
+            future = _voxtral_executor.submit(
+                _voxtral_subprocess, str(chunk_path), _VOXTRAL_MODEL, _MAX_TOKENS, _TEMPERATURE
+            )
+            text = await loop.run_in_executor(None, future.result)
+        else:
+            text = await loop.run_in_executor(None, _do_transcribe, str(chunk_path), model)
     except Exception as exc:
         logger.exception("Transcription failed session=%s seq=%d: %s", session_id, seq, exc)
         # Remove saved chunk so retry can re-save cleanly

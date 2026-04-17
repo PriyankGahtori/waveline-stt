@@ -26,47 +26,64 @@
                     <span id="connText">Checking…</span>
                 </div>
                 <button id="themeToggle" class="btn-icon" title="Toggle theme" aria-label="Toggle theme">
-                    <!-- Sun icon (shown in dark mode to switch to light) -->
                     <svg id="iconSun" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
                         <circle cx="12" cy="12" r="5"/>
                         <path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/>
                     </svg>
-                    <!-- Moon icon (shown in light mode to switch to dark) -->
                     <svg id="iconMoon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" style="display:none">
                         <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>
                     </svg>
                 </button>
-                <span id="recIndicator" class="rec-dot"></span>
             </div>
         </header>
 
         <!-- Controls card -->
         <div class="controls-card">
+
+            <!-- Record / Stop row -->
             <div class="controls-row">
                 <button id="startBtn" class="btn btn-primary">
-                    <svg width="11" height="11" viewBox="0 0 24 24" fill="currentColor">
-                        <circle cx="12" cy="12" r="6"/>
-                    </svg>
+                    <svg width="11" height="11" viewBox="0 0 24 24" fill="currentColor"><circle cx="12" cy="12" r="6"/></svg>
                     Record
                 </button>
                 <button id="stopBtn" class="btn btn-danger" disabled>
-                    <svg width="10" height="10" viewBox="0 0 24 24" fill="currentColor">
-                        <rect x="5" y="5" width="14" height="14" rx="2"/>
-                    </svg>
+                    <svg width="10" height="10" viewBox="0 0 24 24" fill="currentColor"><rect x="5" y="5" width="14" height="14" rx="2"/></svg>
                     Stop
                 </button>
             </div>
-            <div class="options-row">
+
+            <!-- Source indicators (visible during recording) -->
+            <div id="sourceIndicators" class="source-indicators" style="display:none">
+                <div class="source-chip" id="tabChip">
+                    <span class="source-dot tab-dot"></span>
+                    <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+                        <rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/>
+                    </svg>
+                    Tab audio
+                </div>
+                <div class="source-chip mic-chip" id="micChip" style="display:none">
+                    <span class="source-dot mic-dot"></span>
+                    <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+                        <rect x="9" y="2" width="6" height="11" rx="3"/><path d="M5 10a7 7 0 0 0 14 0M12 19v3M8 22h8"/>
+                    </svg>
+                    Microphone
+                </div>
+            </div>
+
+            <!-- Options row (visible when not recording) -->
+            <div id="optionsRow" class="options-row">
                 <select id="modelSelect" class="model-select" title="STT Model">
                     <option value="whisper">Whisper</option>
                     <option value="voxtral">Voxtral</option>
                 </select>
-                <label class="toggle-mic">
-                    <input type="checkbox" id="includeMic" />
-                    <span class="toggle-track"></span>
-                    <span class="toggle-label">Mic</span>
-                </label>
+                <button id="micBtn" class="btn-icon mic-btn" title="Include microphone" aria-pressed="false">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <rect x="9" y="2" width="6" height="11" rx="3"/>
+                        <path d="M5 10a7 7 0 0 0 14 0M12 19v3M8 22h8"/>
+                    </svg>
+                </button>
             </div>
+
         </div>
 
         <!-- Status row -->
@@ -80,7 +97,8 @@
         <!-- Dead chunk warning -->
         <div id="deadWarning" class="dead-warning" style="display:none">
             <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" style="flex-shrink:0;margin-top:1px">
-                <path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/>
+                <path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/>
+                <line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/>
             </svg>
             <span id="deadWarningText"></span>
         </div>

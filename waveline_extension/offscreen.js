@@ -67,6 +67,12 @@ async function trySend(seq, entry) {
     form.append('model', sessionModel);
 
     const res = await fetch(`${serverUrl}/transcribe`, { method: 'POST', body: form });
+    if (res.status === 404 || res.status === 409) {
+      // Session no longer exists (server restart) — no point retrying
+      sendQueue.clear();
+      chrome.runtime.sendMessage({ type: 'SESSION_LOST' });
+      return;
+    }
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
 
     const data = await res.json();
@@ -98,7 +104,7 @@ window.addEventListener('beforeunload', () => {
     // Convert blob to array buffer for storage — best effort
     serializable.push({ seq, retries: entry.retries });
   }
-  chrome.storage.local.set({ scribble_dead_queue_info: serializable });
+  chrome.storage.local.set({ waveline_dead_queue_info: serializable });
 });
 
 function sleep(ms) {
@@ -139,11 +145,13 @@ async function initCapture(streamId, includeMic) {
   if (includeMic) {
     try {
       micStream = await navigator.mediaDevices.getUserMedia({
-        audio: { echoCancellation: true, noiseSuppression: true, channelCount: 1 },
+        audio: { echoCancellation: true, noiseSuppression: true, sampleRate: 16000, channelCount: 1 },
         video: false,
       });
+      chrome.runtime.sendMessage({ type: 'MIC_STATUS', granted: true });
     } catch (e) {
-      console.warn('[offscreen] mic not granted', e);
+      console.warn('[offscreen] mic not granted:', e.name, e.message);
+      chrome.runtime.sendMessage({ type: 'MIC_STATUS', granted: false, reason: e.name });
     }
   }
 
@@ -152,16 +160,15 @@ async function initCapture(streamId, includeMic) {
 
   const tabSrc = audioCtx.createMediaStreamSource(tabStream);
 
-  let sourceNode;
+  // Use a GainNode as a summing bus — both tab and mic connect into it,
+  // Web Audio automatically sums them to mono before the worklet.
+  const mixBus = audioCtx.createGain();
+  tabSrc.connect(mixBus);
   if (micStream) {
     const micSrc = audioCtx.createMediaStreamSource(micStream);
-    const merger = audioCtx.createChannelMerger(2);
-    tabSrc.connect(merger, 0, 0);
-    micSrc.connect(merger, 0, 1);
-    sourceNode = merger;
-  } else {
-    sourceNode = tabSrc;
+    micSrc.connect(mixBus);
   }
+  const sourceNode = mixBus;
 
   workletNode = new AudioWorkletNode(audioCtx, 'pcm-capture', {
     processorOptions: { chunkFrames: 16000 * 4 }, // 4-second chunks

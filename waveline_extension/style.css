@@ -290,51 +290,84 @@ h1 {
 .model-select:focus { border-color: var(--accent-dim); }
 .model-select:disabled { opacity: 0.45; cursor: not-allowed; }
 
-/* ── Mic toggle ── */
-.toggle-mic {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    cursor: pointer;
-    user-select: none;
+/* ── Mic icon button ── */
+.mic-btn {
     margin-left: auto;
-}
-.toggle-mic input { display: none; }
-
-.toggle-track {
-    width: 28px;
-    height: 16px;
-    background: var(--surface-2);
-    border: 1px solid var(--border-2);
-    border-radius: 100px;
+    color: var(--muted);
     position: relative;
-    transition: background 0.18s, border-color 0.18s;
-    flex-shrink: 0;
 }
-.toggle-track::after {
-    content: '';
-    position: absolute;
-    left: 2px;
-    top: 50%;
-    transform: translateY(-50%);
-    width: 10px;
-    height: 10px;
-    background: var(--muted);
-    border-radius: 50%;
-    transition: left 0.18s, background 0.18s;
-}
-.toggle-mic input:checked ~ .toggle-track {
+.mic-btn.active {
     background: var(--accent-bg);
     border-color: var(--accent-dim);
+    color: var(--accent);
 }
-.toggle-mic input:checked ~ .toggle-track::after {
-    left: 14px;
+/* small badge dot when mic is enabled */
+.mic-btn.active::after {
+    content: '';
+    position: absolute;
+    top: 4px;
+    right: 4px;
+    width: 5px;
+    height: 5px;
     background: var(--accent);
+    border-radius: 50%;
+    border: 1px solid var(--surface);
 }
-.toggle-label {
-    font-size: 11.5px;
-    color: var(--muted);
+.mic-btn:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+}
+
+/* ── Source indicators (shown while recording) ── */
+.source-indicators {
+    display: flex;
+    gap: 7px;
+    padding-top: 2px;
+    border-top: 1px solid var(--border);
+}
+
+.source-chip {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    font-size: 11px;
     font-weight: 500;
+    color: var(--muted);
+    padding: 4px 9px;
+    border-radius: 100px;
+    border: 1px solid var(--border);
+    background: var(--surface-2);
+    letter-spacing: 0.01em;
+}
+
+.source-chip.active {
+    color: var(--green);
+    background: var(--green-bg);
+    border-color: rgba(5,150,105,0.25);
+}
+
+.mic-chip.active {
+    color: var(--red);
+    background: var(--red-bg);
+    border-color: rgba(220,38,38,0.2);
+}
+
+.source-dot {
+    width: 5px;
+    height: 5px;
+    border-radius: 50%;
+    background: var(--border-2);
+    flex-shrink: 0;
+}
+
+.source-chip.active .source-dot {
+    background: var(--green);
+    animation: pulse-dot 1.4s ease infinite;
+}
+
+.mic-chip.active .source-dot {
+    background: var(--red);
+    animation: pulse-dot 1.4s ease infinite;
 }
 
 /* ── Status row ── */

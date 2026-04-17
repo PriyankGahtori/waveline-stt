@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Waveline",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Local, private speech-to-text transcription using Whisper or Voxtral. Zero data loss.",
   "icons": {
     "16": "icons/icon16.png",
@@ -22,8 +22,7 @@
     "activeTab",
     "storage",
     "downloads",
-    "scripting",
-    "offscreen"
+    "tabs"
   ],
   "host_permissions": [
     "http://localhost/*",
@@ -37,7 +36,7 @@
   },
   "web_accessible_resources": [
     {
-      "resources": ["pcm-worklet.js"],
+      "resources": ["pcm-worklet.js", "recording.html", "recording.js"],
       "matches": ["<all_urls>"]
     }
   ]

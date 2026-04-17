@@ -1,0 +1,22 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="UTF-8"/>
+  <title>Waveline — Microphone Access</title>
+  <style>
+    body { font-family: system-ui, sans-serif; display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0; background: #f5f6f8; color: #111; }
+    .card { text-align: center; max-width: 360px; padding: 32px; background: #fff; border-radius: 12px; box-shadow: 0 4px 20px rgba(0,0,0,0.1); }
+    h2 { margin-bottom: 10px; font-size: 18px; }
+    p  { color: #6b7280; font-size: 14px; line-height: 1.6; }
+    .status { margin-top: 20px; font-size: 13px; color: #2563eb; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h2>🎙 Microphone Access</h2>
+    <p>Waveline needs microphone access to record your voice alongside tab audio.<br>Please click <strong>Allow</strong> when prompted.</p>
+    <p class="status" id="status">Requesting permission…</p>
+  </div>
+  <script src="mic-permission.js"></script>
+</body>
+</html>
