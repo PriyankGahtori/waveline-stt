@@ -67,6 +67,11 @@ async function trySend(seq, entry) {
     form.append('model', sessionModel);
 
     const res = await fetch(`${serverUrl}/transcribe`, { method: 'POST', body: form });
+    if (res.status === 404 || res.status === 409) {
+      sendQueue.clear();
+      chrome.runtime.sendMessage({ type: 'SESSION_LOST' });
+      return;
+    }
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
 
     const data = await res.json();
@@ -80,12 +85,10 @@ async function trySend(seq, entry) {
     entry.retries++;
     if (entry.retries >= MAX_RETRIES) {
       sendQueue.delete(seq);
-      console.error(`[offscreen] chunk seq=${seq} permanently failed after ${MAX_RETRIES} retries`);
       chrome.runtime.sendMessage({ type: 'CHUNK_DEAD', seq });
     } else {
       const backoff = Math.min(1000 * Math.pow(2, entry.retries - 1), MAX_BACKOFF_MS);
       entry.nextRetryAt = Date.now() + backoff;
-      console.warn(`[offscreen] chunk seq=${seq} retry ${entry.retries} in ${backoff}ms:`, e.message);
     }
   }
 }
@@ -143,7 +146,6 @@ async function initCapture(streamId, includeMic) {
         video: false,
       });
     } catch (e) {
-      console.warn('[offscreen] mic not granted', e);
     }
   }
 

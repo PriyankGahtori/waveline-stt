@@ -72,6 +72,10 @@ chrome.runtime.onMessage.addListener((msg) => {
     deadWarningText.textContent = `Chunk #${msg.seq} permanently failed — gap in transcript.`;
     deadWarning.style.display = 'flex';
   }
+  if (msg.type === 'SESSION_LOST') {
+    setUI(false);
+    setStatus('Server restarted — session lost. Start a new recording.', 'error');
+  }
 });
 
 // ── Server URL settings ───────────────────────────────────────────────────────

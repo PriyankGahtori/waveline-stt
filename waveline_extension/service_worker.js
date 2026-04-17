@@ -3,8 +3,6 @@
 
 const OFFSCREEN_URL = chrome.runtime.getURL('offscreen.html');
 
-let offscreenReady = false;
-
 // ── Offscreen document helpers ──────────────────────────────────────────────
 
 async function ensureOffscreen() {
@@ -22,7 +20,6 @@ async function closeOffscreen() {
     const has = await chrome.offscreen.hasDocument?.() ?? false;
     if (has) await chrome.offscreen.closeDocument();
   } catch {}
-  offscreenReady = false;
 }
 
 // ── Message bus ─────────────────────────────────────────────────────────────
@@ -65,11 +62,6 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     return false;
   }
 
-  if (msg.type === 'OFFSCREEN_READY') {
-    offscreenReady = true;
-    return false;
-  }
-
   // Offscreen signals queue drained after stop — now safe to close
   if (msg.type === 'QUEUE_DRAINED') {
     chrome.storage.local.get(['waveline_session_id', 'waveline_server_url'], async (res) => {
@@ -104,16 +96,10 @@ async function handleStart({ includeMic, model }) {
     });
   });
 
+  // Always recreate offscreen fresh so INIT_CAPTURE is never missed
+  await closeOffscreen();
   await ensureOffscreen();
-
-  if (!offscreenReady) {
-    await new Promise((resolve, reject) => {
-      const deadline = setTimeout(() => reject(new Error('Offscreen timed out')), 3000);
-      const check = setInterval(() => {
-        if (offscreenReady) { clearInterval(check); clearTimeout(deadline); resolve(); }
-      }, 50);
-    });
-  }
+  await new Promise(r => setTimeout(r, 250));
 
   const { waveline_server_url } = await chrome.storage.local.get(['waveline_server_url']);
   const serverUrl = (waveline_server_url || 'http://localhost:8000').replace(/\/$/, '');

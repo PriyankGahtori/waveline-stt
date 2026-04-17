@@ -345,8 +345,8 @@ async def transcribe(
         return {"ok": True, "seq": seq, "text": s["chunks"][seq]}
 
     raw = await audio.read()
-    if not raw:
-        raise HTTPException(status_code=400, detail="Empty audio file")
+    if len(raw) <= 44:  # 44-byte WAV header only = no audio samples
+        return {"ok": True, "seq": seq, "text": ""}
     if len(raw) > _MAX_UPLOAD_BYTES:
         raise HTTPException(status_code=413, detail="Audio file too large")
 
