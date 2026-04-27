@@ -4,7 +4,8 @@ server.py — unified STT backend supporting Whisper and Voxtral models.
 Environment variables:
   LOAD_WHISPER       true|false  (default: true)
   LOAD_VOXTRAL       true|false  (default: true)
-  WHISPER_MODEL      model size  (default: medium)
+  WHISPER_MODEL      model id/size (default: collabora/faster-whisper-medium-hindi)
+  WHISPER_LANGUAGE   language code; empty = auto-detect (default: hi)
   COMPUTE_TYPE       float32     (default: float32)
   BEAM_SIZE          int         (default: 1)
   VOXTRAL_MODEL      model path  (default: mlx-community/Voxtral-Mini-4B-Realtime-2602-4bit)
@@ -33,7 +34,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
@@ -60,7 +61,8 @@ logger.addHandler(_ch)
 
 _LOAD_WHISPER = os.getenv("LOAD_WHISPER", "true").lower() == "true"
 _LOAD_VOXTRAL = os.getenv("LOAD_VOXTRAL", "true").lower() == "true"
-_WHISPER_MODEL = os.getenv("WHISPER_MODEL", "medium")
+_WHISPER_MODEL = os.getenv("WHISPER_MODEL", "collabora/faster-whisper-medium-hindi")
+_WHISPER_LANGUAGE = os.getenv("WHISPER_LANGUAGE", "hi").strip() or None
 _COMPUTE_TYPE = os.getenv("COMPUTE_TYPE", "float32")
 _BEAM_SIZE = int(os.getenv("BEAM_SIZE", "1"))
 _VOXTRAL_MODEL = os.getenv("VOXTRAL_MODEL", "mlx-community/Voxtral-Mini-4B-Realtime-2602-4bit")
@@ -83,7 +85,7 @@ def _load_models():
     if _LOAD_WHISPER:
         try:
             from faster_whisper import WhisperModel
-            logger.info("Loading Whisper model: %s", _WHISPER_MODEL)
+            logger.info("Loading Whisper model: %s language=%s", _WHISPER_MODEL, _WHISPER_LANGUAGE or "auto")
             models["whisper"] = WhisperModel(_WHISPER_MODEL, compute_type=_COMPUTE_TYPE)
             logger.info("Whisper ready")
         except Exception as e:
@@ -99,9 +101,22 @@ def _load_models():
             logger.error("Failed to load Voxtral: %s", e)
 
 
-def _transcribe_whisper(audio_path: str) -> str:
+def _transcribe_whisper(audio_path: str, language: Optional[str] = None) -> str:
+    """Transcribe with Whisper. language=None → auto-detect, language='' → use server default."""
     m = models["whisper"]
-    segments, _ = m.transcribe(audio_path, beam_size=_BEAM_SIZE, vad_filter=True, language="en")
+    transcribe_kwargs = {
+        "beam_size": _BEAM_SIZE,
+        "vad_filter": True,
+        "vad_parameters": {"min_silence_duration_ms": 300},
+        "condition_on_previous_text": False,
+        "without_timestamps": True,
+        "word_timestamps": False,
+    }
+    # Priority: explicit per-request language > server default > auto-detect
+    effective_lang = language if language is not None else _WHISPER_LANGUAGE
+    if effective_lang:
+        transcribe_kwargs["language"] = effective_lang
+    segments, _ = m.transcribe(audio_path, **transcribe_kwargs)
     return " ".join(s.text.strip() for s in segments if s.text.strip())
 
 
@@ -122,13 +137,13 @@ def _voxtral_subprocess(audio_path: str, voxtral_model_id: str, max_tokens: int,
 
 
 _voxtral_executor = concurrent.futures.ProcessPoolExecutor(max_workers=1)
+_io_executor = concurrent.futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix="stt-io")
 
 
-def _do_transcribe(audio_path: str, model_name: str) -> str:
+def _do_transcribe(audio_path: str, model_name: str, language: Optional[str] = None) -> str:
     if model_name == "whisper":
-        return _transcribe_whisper(audio_path)
+        return _transcribe_whisper(audio_path, language=language)
     elif model_name == "voxtral":
-        # Run in dedicated process — MLX segfaults when called from threads
         future = _voxtral_executor.submit(
             _voxtral_subprocess, audio_path, _VOXTRAL_MODEL, _MAX_TOKENS, _TEMPERATURE
         )
@@ -159,51 +174,74 @@ def _get_session(session_id: str) -> dict:
     return s
 
 
-def _create_session(model_name: str, user_tag: str = "") -> str:
+def _create_session(model_name: str, user_tag: str = "", language: Optional[str] = None) -> str:
     session_id = str(uuid.uuid4())
     audio_dir = _RECORDINGS_DIR / session_id / "chunks"
     audio_dir.mkdir(parents=True, exist_ok=True)
     sessions[session_id] = {
         "model": model_name,
+        "language": language,  # None = use server default; "" = auto-detect; "hi"/"en"/etc = override
         "chunks": {},
         "audio_dir": audio_dir,
         "merged_path": None,
         "transcript_path": None,
         "started_at": datetime.now(timezone.utc),
         "closed": False,
-        "last_merged_seq": -1,
+        "last_merged_chunk": -1,
         "user_tag": user_tag,
     }
-    logger.info("Session started: %s model=%s user=%s", session_id, model_name, user_tag)
+    logger.info("Session started: %s model=%s lang=%s user=%s", session_id, model_name, language or "server-default", user_tag)
     return session_id
 
 
 def _merge_audio(session_id: str, force_all: bool = False) -> Optional[Path]:
-    """Merge chunk WAVs in seq order into merged.wav. Returns merged path."""
+    """Incrementally append only new chunks to merged.wav. Returns merged path."""
     s = sessions[session_id]
     chunks_dir = s["audio_dir"]
     session_dir = chunks_dir.parent
-
-    chunk_files = sorted(chunks_dir.glob("chunk_*.wav"), key=lambda p: int(p.stem.split("_")[1]))
-    if not chunk_files:
-        return None
-
     merged_path = session_dir / "merged.wav"
 
-    with wave.open(str(merged_path), "wb") as out_wav:
-        params_set = False
-        for cf in chunk_files:
-            try:
-                with wave.open(str(cf), "rb") as in_wav:
-                    if not params_set:
-                        out_wav.setparams(in_wav.getparams())
-                        params_set = True
-                    out_wav.writeframes(in_wav.readframes(in_wav.getnframes()))
-            except Exception as e:
-                logger.warning("Skipping corrupt chunk %s: %s", cf.name, e)
+    all_chunks = sorted(chunks_dir.glob("chunk_*.wav"), key=lambda p: int(p.stem.split("_")[1]))
+    if not all_chunks:
+        return None
 
+    last_merged = s.get("last_merged_chunk", -1)
+    new_chunks = [cf for cf in all_chunks if int(cf.stem.split("_")[1]) > last_merged]
+    if not new_chunks:
+        return merged_path if merged_path.exists() else None
+
+    # Append mode: open existing merged.wav and add only new frames
+    if merged_path.exists() and last_merged >= 0:
+        with wave.open(str(merged_path), "rb") as existing:
+            params = existing.getparams()
+            existing_frames = existing.readframes(existing.getnframes())
+    else:
+        params = None
+        existing_frames = None
+
+    try:
+        with wave.open(str(merged_path), "wb") as out_wav:
+            first_new = True
+            if params is not None:
+                out_wav.setparams(params)
+                out_wav.writeframes(existing_frames)
+            for cf in new_chunks:
+                try:
+                    with wave.open(str(cf), "rb") as in_wav:
+                        if params is None and first_new:
+                            out_wav.setparams(in_wav.getparams())
+                            params = in_wav.getparams()
+                            first_new = False
+                        out_wav.writeframes(in_wav.readframes(in_wav.getnframes()))
+                except Exception as e:
+                    logger.warning("Skipping corrupt chunk %s: %s", cf.name, e)
+    except Exception as e:
+        logger.error("Merge failed for session %s: %s", session_id, e)
+        return None
+
+    s["last_merged_chunk"] = int(new_chunks[-1].stem.split("_")[1])
     s["merged_path"] = merged_path
-    logger.info("Merged audio for session %s → %s", session_id, merged_path)
+    logger.info("Merged +%d chunks for session %s → %s", len(new_chunks), session_id, merged_path)
     return merged_path
 
 
@@ -212,13 +250,24 @@ def _write_transcript(session_id: str) -> Path:
     session_dir = s["audio_dir"].parent
     transcript_path = session_dir / "transcript.txt"
 
-    # Write chunks in seq order
     ordered = sorted(s["chunks"].items())
-    text = "\n".join(t for _, t in ordered if t)
-    transcript_path.write_text(text, encoding="utf-8")
+    with transcript_path.open("w", encoding="utf-8") as f:
+        for _, text in ordered:
+            if text:
+                f.write(text)
+                f.write("\n")
 
     s["transcript_path"] = transcript_path
     return transcript_path
+
+
+async def _merge_and_write_async(session_id: str) -> tuple:
+    """Run merge + transcript write concurrently in the IO thread pool."""
+    loop = asyncio.get_event_loop()
+    merge_fut = loop.run_in_executor(_io_executor, _merge_audio, session_id, True)
+    transcript_fut = loop.run_in_executor(_io_executor, _write_transcript, session_id)
+    merged, transcript = await asyncio.gather(merge_fut, transcript_fut)
+    return merged, transcript
 
 
 # ── Lifespan ──────────────────────────────────────────────────────────────────
@@ -227,14 +276,19 @@ _merge_task: Optional[asyncio.Task] = None
 
 
 async def _periodic_merge():
+    loop = asyncio.get_event_loop()
     while True:
         await asyncio.sleep(_MERGE_INTERVAL_SECS)
-        for sid, s in list(sessions.items()):
-            if not s["closed"]:
-                try:
-                    _merge_audio(sid)
-                except Exception as e:
-                    logger.warning("Periodic merge failed for %s: %s", sid, e)
+        tasks = [
+            loop.run_in_executor(_io_executor, _merge_audio, sid, False)
+            for sid, s in list(sessions.items())
+            if not s["closed"]
+        ]
+        if tasks:
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            for sid, result in zip([sid for sid, s in list(sessions.items()) if not s["closed"]], results):
+                if isinstance(result, Exception):
+                    logger.warning("Periodic merge failed for %s: %s", sid, result)
 
 
 @asynccontextmanager
@@ -276,16 +330,25 @@ async def log_requests(request: Request, call_next):
 class SessionStartOut(BaseModel):
     session_id: str
     model: str
+    language: Optional[str]
 
 
 @app.post("/session/start", response_model=SessionStartOut)
-async def session_start(model: str = Form("whisper"), user_tag: str = Form("")):
+async def session_start(
+    model: str = Form("whisper"),
+    user_tag: str = Form(""),
+    language: str = Form(""),  # "" = use server default; "auto" or specific code like "en"/"hi"
+):
     if model not in ("whisper", "voxtral"):
         raise HTTPException(status_code=400, detail="model must be 'whisper' or 'voxtral'")
     if models[model] is None:
         raise HTTPException(status_code=503, detail=f"Model '{model}' not loaded")
-    session_id = _create_session(model, user_tag)
-    return {"session_id": session_id, "model": model}
+    # Normalise: "auto" → None (faster-whisper auto-detect), "" → None (use server default)
+    lang = language.strip().lower() or None
+    if lang == "auto":
+        lang = ""  # empty string signals explicit auto-detect, overriding server default
+    session_id = _create_session(model, user_tag, language=lang)
+    return {"session_id": session_id, "model": model, "language": lang}
 
 
 class SessionStopOut(BaseModel):
@@ -306,16 +369,18 @@ async def session_stop(session_id: str = Form(...)):
             "chunk_count": len(s["chunks"]),
         }
 
-    merged = _merge_audio(session_id, force_all=True)
-    transcript = _write_transcript(session_id)
     s["closed"] = True
-    logger.info("Session stopped: %s chunks=%d", session_id, len(s["chunks"]))
+    chunk_count = len(s["chunks"])
+    logger.info("Session stopped: %s chunks=%d — running merge+transcript in background", session_id, chunk_count)
+
+    # Run merge + transcript write concurrently, non-blocking
+    merged, transcript = await _merge_and_write_async(session_id)
 
     return {
         "session_id": session_id,
         "merged_path": str(merged) if merged else None,
         "transcript_path": str(transcript),
-        "chunk_count": len(s["chunks"]),
+        "chunk_count": chunk_count,
     }
 
 
@@ -354,25 +419,90 @@ async def transcribe(
     chunk_path = s["audio_dir"] / f"chunk_{seq:05d}.wav"
     chunk_path.write_bytes(raw)
 
-    # Transcribe — Voxtral runs in a ProcessPoolExecutor (MLX not thread-safe)
     try:
         loop = asyncio.get_event_loop()
+        lang = s.get("language")  # None = server default, "" = auto-detect, "hi"/"en"/etc = override
         if model == "voxtral":
             future = _voxtral_executor.submit(
                 _voxtral_subprocess, str(chunk_path), _VOXTRAL_MODEL, _MAX_TOKENS, _TEMPERATURE
             )
             text = await loop.run_in_executor(None, future.result)
         else:
-            text = await loop.run_in_executor(None, _do_transcribe, str(chunk_path), model)
+            text = await loop.run_in_executor(None, _do_transcribe, str(chunk_path), model, lang)
     except Exception as exc:
         logger.exception("Transcription failed session=%s seq=%d: %s", session_id, seq, exc)
-        # Remove saved chunk so retry can re-save cleanly
         chunk_path.unlink(missing_ok=True)
         raise HTTPException(status_code=500, detail="Transcription failed") from exc
 
     s["chunks"][seq] = text
-    logger.info("Transcribed session=%s seq=%d model=%s chars=%d", session_id, seq, model, len(text))
+    logger.info("Transcribed session=%s seq=%d model=%s lang=%s chars=%d", session_id, seq, model, s.get("language") or "default", len(text))
     return {"ok": True, "seq": seq, "text": text}
+
+
+@app.websocket("/ws/transcribe/{session_id}")
+async def ws_transcribe(websocket: WebSocket, session_id: str, model: str = "whisper"):
+    """
+    WebSocket streaming transcription endpoint.
+    Client sends binary frames: 4-byte little-endian seq_number + WAV bytes.
+    Server responds with JSON: {"seq": N, "text": "..."}
+    """
+    await websocket.accept()
+    try:
+        s = _get_session(session_id)
+    except HTTPException as exc:
+        await websocket.close(code=1008, reason=exc.detail)
+        return
+
+    if models[model] is None:
+        await websocket.close(code=1008, reason=f"Model '{model}' not loaded")
+        return
+
+    loop = asyncio.get_event_loop()
+    tmp_dir = s["audio_dir"]
+
+    try:
+        while True:
+            raw = await websocket.receive_bytes()
+            if len(raw) < 5:
+                continue
+
+            seq = int.from_bytes(raw[:4], "little")
+            wav_bytes = raw[4:]
+
+            if len(wav_bytes) <= 44:
+                await websocket.send_json({"seq": seq, "text": ""})
+                continue
+
+            if seq in s["chunks"]:
+                await websocket.send_json({"seq": seq, "text": s["chunks"][seq]})
+                continue
+
+            chunk_path = tmp_dir / f"chunk_{seq:05d}.wav"
+            chunk_path.write_bytes(wav_bytes)
+
+            try:
+                lang = s.get("language")
+                if model == "voxtral":
+                    future = _voxtral_executor.submit(
+                        _voxtral_subprocess, str(chunk_path), _VOXTRAL_MODEL, _MAX_TOKENS, _TEMPERATURE
+                    )
+                    text = await loop.run_in_executor(None, future.result)
+                else:
+                    text = await loop.run_in_executor(None, _do_transcribe, str(chunk_path), model, lang)
+            except Exception as exc:
+                logger.exception("WS transcription failed session=%s seq=%d: %s", session_id, seq, exc)
+                chunk_path.unlink(missing_ok=True)
+                await websocket.send_json({"seq": seq, "text": "", "error": "transcription failed"})
+                continue
+
+            s["chunks"][seq] = text
+            logger.info("WS transcribed session=%s seq=%d chars=%d", session_id, seq, len(text))
+            await websocket.send_json({"seq": seq, "text": text})
+
+    except WebSocketDisconnect:
+        pass
+    except Exception as exc:
+        logger.warning("WS session=%s closed with error: %s", session_id, exc)
 
 
 @app.get("/transcript/{session_id}")
@@ -387,8 +517,8 @@ async def get_transcript(session_id: str):
 async def get_audio(session_id: str):
     s = _get_session(session_id)
     if not s["merged_path"] or not Path(s["merged_path"]).exists():
-        # Try merging on demand
-        merged = _merge_audio(session_id)
+        loop = asyncio.get_event_loop()
+        merged = await loop.run_in_executor(_io_executor, _merge_audio, session_id, False)
         if not merged:
             raise HTTPException(status_code=404, detail="No audio available for this session")
     return FileResponse(str(s["merged_path"]), media_type="audio/wav", filename=f"{session_id}.wav")
@@ -399,7 +529,15 @@ async def health():
     loaded = {k: v is not None for k, v in models.items()}
     if not any(loaded.values()):
         return JSONResponse(status_code=503, content={"ok": False, "models": loaded})
-    return {"ok": True, "models": loaded}
+    return {
+        "ok": True,
+        "models": loaded,
+        "defaults": {
+            "whisper_language": _WHISPER_LANGUAGE or "auto",
+            "whisper_model": _WHISPER_MODEL,
+            "voxtral_model": _VOXTRAL_MODEL,
+        },
+    }
 
 
 # ── MCP server ────────────────────────────────────────────────────────────────

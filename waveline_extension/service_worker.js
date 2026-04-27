@@ -62,7 +62,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     return false;
   }
 
-  // Offscreen signals queue drained after stop — now safe to close
+  // Offscreen signals queue drained after stop — close session, then notify popup
   if (msg.type === 'QUEUE_DRAINED') {
     chrome.storage.local.get(['waveline_session_id', 'waveline_server_url'], async (res) => {
       const serverUrl = (res.waveline_server_url || 'http://localhost:8000').replace(/\/$/, '');
@@ -78,6 +78,8 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       }
       await closeOffscreen();
       chrome.storage.local.set({ waveline_recording: false, waveline_session_id: null });
+      // Forward to popup so it can re-enable the Start button
+      chrome.runtime.sendMessage({ type: 'QUEUE_DRAINED' }).catch(() => {});
     });
     return false;
   }
@@ -85,7 +87,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 
 // ── Start flow ───────────────────────────────────────────────────────────────
 
-async function handleStart({ includeMic, model }) {
+async function handleStart({ includeMic, model, silenceThreshold, transport, language }) {
   const [tab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
   if (!tab) throw new Error('No active tab found.');
 
@@ -108,6 +110,7 @@ async function handleStart({ includeMic, model }) {
   // Create session on backend
   const form = new FormData();
   form.append('model', selectedModel);
+  if (language) form.append('language', language); // "" or omitted = server default
   const sessionRes = await fetch(`${serverUrl}/session/start`, { method: 'POST', body: form });
   if (!sessionRes.ok) throw new Error(`Failed to start session: HTTP ${sessionRes.status}`);
   const { session_id: sessionId } = await sessionRes.json();
@@ -121,6 +124,8 @@ async function handleStart({ includeMic, model }) {
     serverUrl,
     sessionId,
     model: selectedModel,
+    silenceThreshold: silenceThreshold ?? 0.003,
+    transport: transport || 'ws',
   });
 
   chrome.storage.local.set({ waveline_recording: true });

@@ -126,6 +126,30 @@
                     <button id="saveUrlBtn" class="btn btn-primary btn-sm">Save</button>
                 </div>
                 <p id="urlStatus" class="url-status"></p>
+
+                <label for="languageInput" class="field-label">Whisper language</label>
+                <input type="text" id="languageInput" placeholder="server default: hi"
+                       spellcheck="false" maxlength="10"
+                       style="padding:6px 9px;font-size:12px;font-family:var(--mono);background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:var(--radius-sm);outline:none;width:100%;box-sizing:border-box;" />
+                <p class="field-hint-text">Language code: <code>hi</code>, <code>en</code>, <code>zh</code>… or <code>auto</code> for detection. Empty = use server default.</p>
+
+                <label for="transportSelect" class="field-label">Transport</label>
+                <select id="transportSelect" class="model-select">
+                    <option value="ws">WebSocket (low latency, auto-fallback to HTTP)</option>
+                    <option value="http">HTTP only</option>
+                </select>
+
+                <label class="field-label toggle-row">
+                    <span>Include microphone</span>
+                    <input type="checkbox" id="micToggle" />
+                </label>
+
+                <label for="silenceThreshold" class="field-label">
+                    Silence gate
+                    <span id="silenceThresholdVal" class="field-hint">0.003</span>
+                </label>
+                <input type="range" id="silenceThreshold" min="0" max="0.02" step="0.001" value="0.003" />
+                <p class="field-hint-text">Lower = transcribe quieter audio. Higher = skip more silence.</p>
             </div>
         </details>
 

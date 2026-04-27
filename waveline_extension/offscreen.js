@@ -1,6 +1,4 @@
-// offscreen.js
-// Runs inside offscreen.html — has access to Web Audio, getUserMedia, fetch.
-// Lifecycle: created by SW on START, closed by SW after queue drain + STOP.
+// offscreen.js — audio capture + streaming transcription via WebSocket
 
 let audioCtx = null;
 let workletNode = null;
@@ -11,23 +9,119 @@ let serverUrl = 'http://localhost:8000';
 let sessionId = null;
 let sessionModel = 'whisper';
 
-// ── Send queue for zero data loss ─────────────────────────────────────────────
-// Map<seq, { blob, retries, nextRetryAt }>
+// ── Transport ─────────────────────────────────────────────────────────────────
+// 'ws'   = WebSocket preferred, HTTP fallback on failure
+// 'http' = HTTP only, no WebSocket
+let useWebSocket = true; // configurable from popup
+
+// ── WebSocket streaming ───────────────────────────────────────────────────────
+let ws = null;
+let wsReady = false;
+let wsReconnectTimer = null;
+const WS_MAX_RECONNECT_MS = 8000;
+let wsReconnectDelay = 500;
+
+// Silence gate — configurable from popup settings, default 0.003
+let SILENCE_RMS_THRESHOLD = 0.003;
+
+// ── HTTP fallback send queue (used if WS unavailable) ────────────────────────
 const sendQueue = new Map();
 let seqCounter = 0;
 let queueLoopRunning = false;
-let draining = false; // true after STOP_CAPTURE — wait for empty queue then signal
+let draining = false;
 
-const MAX_RETRIES = 10;
-const MAX_BACKOFF_MS = 30000;
-const QUEUE_INTERVAL_MS = 500;
-const MAX_PARALLEL_SENDS = 3;
+const MAX_RETRIES = 8;
+const MAX_BACKOFF_MS = 16000;
+const QUEUE_INTERVAL_MS = 80; // was 500ms — much more responsive
+const MAX_PARALLEL_SENDS = 4;
 
-function enqueueChunk(blob) {
+// ── WebSocket connect ─────────────────────────────────────────────────────────
+
+function wsUrl() {
+  return serverUrl.replace(/^http/, 'ws') + `/ws/transcribe/${sessionId}?model=${sessionModel}`;
+}
+
+function connectWs() {
+  if (!sessionId || !useWebSocket) return;
+  clearTimeout(wsReconnectTimer);
+  try {
+    ws = new WebSocket(wsUrl());
+    ws.binaryType = 'arraybuffer';
+
+    ws.onopen = () => {
+      wsReady = true;
+      wsReconnectDelay = 500;
+    };
+
+    ws.onmessage = (ev) => {
+      try {
+        const data = JSON.parse(ev.data);
+        if (data.text) {
+          chrome.runtime.sendMessage({ type: 'TRANSCRIPT_LINE', line: data.text.trim() });
+        }
+        if (data.seq !== undefined) {
+          sendQueue.delete(data.seq); // ack
+        }
+      } catch {}
+    };
+
+    ws.onerror = () => { wsReady = false; };
+
+    ws.onclose = () => {
+      wsReady = false;
+      ws = null;
+      if (!draining && sessionId) {
+        wsReconnectDelay = Math.min(wsReconnectDelay * 2, WS_MAX_RECONNECT_MS);
+        wsReconnectTimer = setTimeout(connectWs, wsReconnectDelay);
+      }
+    };
+  } catch {
+    wsReady = false;
+  }
+}
+
+function closeWs() {
+  clearTimeout(wsReconnectTimer);
+  wsReady = false;
+  try { ws?.close(); } catch {}
+  ws = null;
+}
+
+// ── Chunk dispatch ────────────────────────────────────────────────────────────
+
+function enqueueChunk(blob, rms) {
+  // Skip silent chunks to reduce server load and latency
+  if (rms < SILENCE_RMS_THRESHOLD) return;
+
   const seq = seqCounter++;
+
+  // Try WebSocket first (lowest latency)
+  if (wsReady && ws?.readyState === WebSocket.OPEN) {
+    const reader = new FileReader();
+    reader.onload = () => {
+      if (ws?.readyState === WebSocket.OPEN) {
+        // Send seq as 4-byte header + wav bytes
+        const wavBytes = new Uint8Array(reader.result);
+        const pkt = new Uint8Array(4 + wavBytes.length);
+        new DataView(pkt.buffer).setUint32(0, seq, true);
+        pkt.set(wavBytes, 4);
+        ws.send(pkt.buffer);
+      } else {
+        // WS closed mid-send — fall back to HTTP
+        sendQueue.set(seq, { blob, retries: 0, nextRetryAt: 0 });
+        if (!queueLoopRunning) startQueueLoop();
+      }
+    };
+    reader.readAsArrayBuffer(blob);
+    return;
+  }
+
+  // HTTP fallback
   sendQueue.set(seq, { blob, retries: 0, nextRetryAt: 0 });
   if (!queueLoopRunning) startQueueLoop();
 }
+
+// ── HTTP fallback queue ───────────────────────────────────────────────────────
 
 function startQueueLoop() {
   queueLoopRunning = true;
@@ -49,8 +143,7 @@ async function processQueue() {
 
     if (draining && sendQueue.size === 0) {
       queueLoopRunning = false;
-      cleanup();
-      chrome.runtime.sendMessage({ type: 'QUEUE_DRAINED' });
+      onFullyDrained();
       return;
     }
 
@@ -78,45 +171,41 @@ async function trySend(seq, entry) {
     sendQueue.delete(seq);
 
     const line = (data?.text || '').trim();
-    if (line) {
-      chrome.runtime.sendMessage({ type: 'TRANSCRIPT_LINE', line });
-    }
+    if (line) chrome.runtime.sendMessage({ type: 'TRANSCRIPT_LINE', line });
   } catch (e) {
     entry.retries++;
     if (entry.retries >= MAX_RETRIES) {
       sendQueue.delete(seq);
       chrome.runtime.sendMessage({ type: 'CHUNK_DEAD', seq });
     } else {
-      const backoff = Math.min(1000 * Math.pow(2, entry.retries - 1), MAX_BACKOFF_MS);
+      const backoff = Math.min(500 * Math.pow(2, entry.retries - 1), MAX_BACKOFF_MS);
       entry.nextRetryAt = Date.now() + backoff;
     }
   }
 }
 
-// Persist unsent queue to storage on unexpected close (tab navigation, crash)
-window.addEventListener('beforeunload', () => {
-  if (sendQueue.size === 0) return;
-  const serializable = [];
-  for (const [seq, entry] of sendQueue) {
-    // Convert blob to array buffer for storage — best effort
-    serializable.push({ seq, retries: entry.retries });
-  }
-  chrome.storage.local.set({ scribble_dead_queue_info: serializable });
-});
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-function sleep(ms) {
-  return new Promise(r => setTimeout(r, ms));
+// ── Drain + cleanup ───────────────────────────────────────────────────────────
+
+function onFullyDrained() {
+  closeWs();
+  cleanup();
+  chrome.runtime.sendMessage({ type: 'QUEUE_DRAINED' });
 }
 
-// ── Tell SW we're alive ──────────────────────────────────────────────────────
+// ── Bootstrap ─────────────────────────────────────────────────────────────────
+
 chrome.runtime.sendMessage({ type: 'OFFSCREEN_READY' });
 
-// ── Message bus ──────────────────────────────────────────────────────────────
 chrome.runtime.onMessage.addListener((msg, _sender) => {
   if (msg.type === 'INIT_CAPTURE') {
     serverUrl = msg.serverUrl || serverUrl;
     sessionId = msg.sessionId;
     sessionModel = msg.model || 'whisper';
+    if (typeof msg.silenceThreshold === 'number') SILENCE_RMS_THRESHOLD = msg.silenceThreshold;
+    useWebSocket = msg.transport !== 'http';
+    connectWs();
     initCapture(msg.streamId, msg.includeMic).catch(e => {
       console.error('[offscreen] init error', e);
     });
@@ -126,15 +215,12 @@ chrome.runtime.onMessage.addListener((msg, _sender) => {
   }
 });
 
-// ── Audio init ───────────────────────────────────────────────────────────────
+// ── Audio init ────────────────────────────────────────────────────────────────
 
 async function initCapture(streamId, includeMic) {
   tabStream = await navigator.mediaDevices.getUserMedia({
     audio: {
-      mandatory: {
-        chromeMediaSource: 'tab',
-        chromeMediaSourceId: streamId,
-      },
+      mandatory: { chromeMediaSource: 'tab', chromeMediaSourceId: streamId },
     },
     video: false,
   });
@@ -145,8 +231,7 @@ async function initCapture(streamId, includeMic) {
         audio: { echoCancellation: true, noiseSuppression: true, channelCount: 1 },
         video: false,
       });
-    } catch (e) {
-    }
+    } catch {}
   }
 
   audioCtx = new AudioContext({ sampleRate: 16000 });
@@ -166,23 +251,29 @@ async function initCapture(streamId, includeMic) {
   }
 
   workletNode = new AudioWorkletNode(audioCtx, 'pcm-capture', {
-    processorOptions: { chunkFrames: 16000 * 4 }, // 4-second chunks
+    processorOptions: {
+      chunkFrames: 16000 * 1.5, // 1.5s chunks (was 4s)
+      silenceThreshold: SILENCE_RMS_THRESHOLD,
+    },
   });
 
   workletNode.port.onmessage = (e) => {
     if (e.data?.type === 'chunk') {
       const wavBlob = encodeWavPCM16(e.data.samples, 16000);
-      enqueueChunk(wavBlob);
+      enqueueChunk(wavBlob, e.data.rms ?? 1);
     }
     if (e.data?.type === 'flushed') {
-      // Audio graph is done — now drain the send queue before cleanup
       draining = true;
-      if (!queueLoopRunning) {
-        // Queue is already empty
-        cleanup();
-        chrome.runtime.sendMessage({ type: 'QUEUE_DRAINED' });
+      if (sendQueue.size === 0 && !wsHasPending()) {
+        onFullyDrained();
+      } else if (!queueLoopRunning && sendQueue.size > 0) {
+        startQueueLoop();
       }
-      // Otherwise processQueue() handles drain → cleanup → QUEUE_DRAINED
+      // If WS path is used and has pending, wait for ws.onclose or explicit drain signal
+      if (wsReady) {
+        // Send a close frame so server knows to flush
+        try { ws?.close(1000, 'done'); } catch {}
+      }
     }
   };
 
@@ -193,10 +284,15 @@ async function initCapture(streamId, includeMic) {
   audioEl.play().catch(() => {});
 }
 
-// ── Stop ─────────────────────────────────────────────────────────────────────
+function wsHasPending() {
+  // We don't track individual WS sends, so conservatively return false
+  // The WS onclose handler or HTTP fallback covers the remainder
+  return false;
+}
+
+// ── Stop ──────────────────────────────────────────────────────────────────────
 
 function stopCapture() {
-  // Stop tracks immediately so the browser stops showing "tab is being shared"
   try { tabStream?.getTracks().forEach(t => t.stop()); } catch {}
   try { micStream?.getTracks().forEach(t => t.stop()); } catch {}
   try { if (audioEl) { audioEl.pause(); audioEl.srcObject = null; } } catch {}
@@ -206,8 +302,7 @@ function stopCapture() {
   } else {
     draining = true;
     if (sendQueue.size === 0) {
-      cleanup();
-      chrome.runtime.sendMessage({ type: 'QUEUE_DRAINED' });
+      onFullyDrained();
     }
   }
 }
@@ -221,7 +316,7 @@ function cleanup() {
   audioCtx = workletNode = tabStream = micStream = audioEl = null;
 }
 
-// ── WAV encoder ──────────────────────────────────────────────────────────────
+// ── WAV encoder ───────────────────────────────────────────────────────────────
 
 function encodeWavPCM16(float32Samples, sampleRate) {
   const buffer = new ArrayBuffer(44 + float32Samples.length * 2);

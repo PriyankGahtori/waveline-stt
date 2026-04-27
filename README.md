@@ -12,13 +12,13 @@
 - [Requirements](#requirements)
 - [Installation](#installation)
 - [Running the Server](#running-the-server)
-- [Configuration](#configuration)
+- [Server Configuration](#server-configuration)
 - [Chrome Extension Setup](#chrome-extension-setup)
+- [Extension Settings Guide](#extension-settings-guide)
 - [API Reference](#api-reference)
 - [MCP Server](#mcp-server)
 - [Output Files](#output-files)
 - [Zero-Loss Design](#zero-loss-design)
-- [Tests Performed](#tests-performed)
 - [Known Limitations](#known-limitations)
 
 ---
@@ -26,14 +26,19 @@
 ## Features
 
 - **Real-time transcription** of browser tab audio (meetings, YouTube, any tab)
+- **WebSocket streaming** — single persistent connection per session, results returned as soon as each chunk is transcribed
+- **HTTP fallback** — automatically falls back to per-chunk HTTP POST if WebSocket is unavailable
+- **Silence gate** — silent audio chunks are detected client-side and never sent, reducing latency and server load
+- **1.5-second chunks** — transcription starts 1.5 s after speech, down from 4 s
 - **Zero data loss** — retry queue with exponential backoff; chunks are never silently dropped
 - **Dual model support** — switch between OpenAI Whisper and Mistral Voxtral from the extension popup
 - **Session management** — each recording is isolated under a UUID; safe for concurrent multi-user use
-- **Audio file saving** — every chunk saved as WAV; merged into a single file on stop or on a configurable interval
+- **Audio file saving** — every chunk saved as WAV; merged incrementally into a single file (only new chunks appended each time)
 - **Transcript persistence** — full transcript written to disk in chronological order on session stop
+- **Async I/O** — audio merge and transcript write run concurrently in a thread pool, never blocking the event loop
 - **MCP server** — all session operations exposed as tools for Claude Code and other MCP clients
 - **Live connection status** — popup shows whether backend is reachable and which models are loaded
-- **Dead-chunk warning** — user notified if a chunk permanently fails after 10 retries
+- **Dead-chunk warning** — user notified if a chunk permanently fails after 8 retries
 - **Microphone mixing** — optional mic capture merged with tab audio for in-person + remote scenarios
 
 ---
@@ -41,53 +46,62 @@
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│  Chrome Extension (Manifest V3)                                  │
-│                                                                   │
-│  ┌─────────────┐    ┌──────────────────┐    ┌─────────────────┐ │
-│  │  popup.js   │◄──►│ service_worker.js│◄──►│  offscreen.js   │ │
-│  │             │    │                  │    │                  │ │
-│  │ • Model     │    │ • Session UUID   │    │ • Web Audio API  │ │
-│  │   selector  │    │ • /session/start │    │ • PCM worklet    │ │
-│  │ • Conn stat │    │ • /session/stop  │    │ • Retry queue    │ │
-│  │ • Transcript│    │ • Message relay  │    │ • WAV encoder    │ │
-│  └─────────────┘    └──────────────────┘    └────────┬────────┘ │
-│                                                       │          │
-│                                              pcm-worklet.js      │
-│                                              (AudioWorklet)      │
-└───────────────────────────────────────────────────────┼─────────┘
-                                                        │ POST /transcribe
-                                                        │ (session_id, seq, model, audio)
+┌─────────────────────────────────────────────────────────────────────┐
+│  Chrome Extension (Manifest V3)                                      │
+│                                                                       │
+│  ┌─────────────┐    ┌──────────────────┐    ┌───────────────────┐   │
+│  │  popup.js   │◄──►│ service_worker.js│◄──►│   offscreen.js    │   │
+│  │             │    │                  │    │                    │   │
+│  │ • Model     │    │ • Session UUID   │    │ • Web Audio API    │   │
+│  │   selector  │    │ • /session/start │    │ • PCM worklet      │   │
+│  │ • Transport │    │ • /session/stop  │    │ • WebSocket send   │   │
+│  │   selector  │    │ • Message relay  │    │ • HTTP fallback     │   │
+│  │ • Mic toggle│    │                  │    │ • Silence gate      │   │
+│  │ • Silence   │    │                  │    │ • Retry queue       │   │
+│  │   gate      │    │                  │    │ • WAV encoder       │   │
+│  │ • Conn stat │    │                  │    │                    │   │
+│  │ • Transcript│    │                  │    │                    │   │
+│  └─────────────┘    └──────────────────┘    └────────┬───────────┘  │
+│                                                       │              │
+│                                              pcm-worklet.js          │
+│                                              (AudioWorklet)          │
+└───────────────────────────────────────────────────────┼─────────────┘
+                                                        │ WS /ws/transcribe/{id}
+                                                        │ or POST /transcribe
                                                         ▼
-┌─────────────────────────────────────────────────────────────────┐
-│  server.py  (FastAPI :8000 + FastMCP :8001)                      │
-│                                                                   │
-│  ┌──────────────┐  ┌──────────────┐  ┌────────────────────────┐ │
-│  │ Model        │  │ Session      │  │ MCP Tools              │ │
-│  │ Registry     │  │ Store        │  │                        │ │
-│  │              │  │              │  │ • start_session        │ │
-│  │ • Whisper    │  │ • chunks{}   │  │ • stop_session         │ │
-│  │   (faster-   │  │ • audio_dir  │  │ • get_transcript       │ │
-│  │   whisper)   │  │ • merged_path│  │ • get_audio_path       │ │
-│  │ • Voxtral    │  │ • closed     │  │ • set_model            │ │
-│  │   (mlx-audio)│  │              │  │                        │ │
-│  └──────────────┘  └──────────────┘  └────────────────────────┘ │
-│                                                                   │
-│  recordings/                                                      │
-│  └── {session_id}/                                               │
-│      ├── chunks/chunk_00000.wav … chunk_NNNNN.wav                │
-│      ├── merged.wav                                              │
-│      └── transcript.txt                                          │
-└─────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────┐
+│  server.py  (FastAPI :8000 + FastMCP :8001)                          │
+│                                                                       │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────────────────┐   │
+│  │ Model        │  │ Session      │  │ MCP Tools                │   │
+│  │ Registry     │  │ Store        │  │                          │   │
+│  │              │  │              │  │ • start_session          │   │
+│  │ • Whisper    │  │ • chunks{}   │  │ • stop_session           │   │
+│  │   (faster-   │  │ • audio_dir  │  │ • get_transcript         │   │
+│  │   whisper)   │  │ • merged_path│  │ • get_audio_path         │   │
+│  │ • Voxtral    │  │ • closed     │  │ • set_model              │   │
+│  │   (mlx-audio)│  │              │  │                          │   │
+│  └──────────────┘  └──────────────┘  └──────────────────────────┘   │
+│                                                                       │
+│  IO thread pool (4 threads) — merge + transcript write off-loop      │
+│                                                                       │
+│  recordings/                                                          │
+│  └── {session_id}/                                                   │
+│      ├── chunks/chunk_00000.wav … chunk_NNNNN.wav                    │
+│      ├── merged.wav                                                  │
+│      └── transcript.txt                                              │
+└─────────────────────────────────────────────────────────────────────┘
 ```
 
 ### Data Flow
 
-1. **Start**: popup sends `START_RECORDING` → service worker generates UUID → calls `POST /session/start` → gets `session_id` back
-2. **Capture**: offscreen document creates Web Audio graph (tab audio + optional mic) → AudioWorklet buffers 4-second PCM chunks
-3. **Send**: each chunk is WAV-encoded and placed in an in-memory retry queue with a sequence number
-4. **Transcribe**: queue processor sends chunks to `POST /transcribe` with `session_id`, `seq`, and `model` → server saves chunk WAV and returns transcript text
-5. **Stop**: worklet flushes partial chunk → queue drains to empty → service worker calls `POST /session/stop` → server merges all WAVs and writes `transcript.txt`
+1. **Start**: popup reads settings (transport, mic, silence threshold) → sends `START_RECORDING` → service worker calls `POST /session/start` → gets `session_id` back
+2. **Capture**: offscreen document creates Web Audio graph (tab + optional mic) → AudioWorklet buffers 1.5-second PCM chunks and computes RMS
+3. **Silence gate**: chunks with RMS below the threshold are discarded immediately — no network round trip
+4. **Send (WebSocket)**: if transport = `ws`, chunk is sent as a binary frame (4-byte seq + WAV bytes) over a persistent WebSocket connection; result JSON arrives back immediately
+5. **Send (HTTP fallback)**: if WebSocket is unavailable or transport = `http`, chunk goes via `POST /transcribe`; up to 4 in-flight simultaneously
+6. **Transcribe**: server saves chunk WAV, runs Whisper/Voxtral, returns transcript text; Whisper uses VAD + no timestamp mode for speed
+7. **Stop**: worklet flushes partial chunk → queue fully drains → service worker calls `POST /session/stop` → server concurrently merges WAV and writes transcript in IO thread pool → popup Start button re-enabled
 
 ---
 
@@ -109,12 +123,12 @@ stt_plugin/
     ├── manifest.json
     ├── icons/                       # icon16.png, icon48.png, icon128.png
     ├── popup.html                   # Extension UI
-    ├── popup.js                     # UI logic: model selector, conn status
+    ├── popup.js                     # UI logic + settings wiring
     ├── style.css
     ├── service_worker.js            # Background: session lifecycle, message relay
     ├── offscreen.html               # Offscreen document host
-    ├── offscreen.js                 # Audio capture + retry send queue
-    └── pcm-worklet.js               # AudioWorklet: real-time PCM buffering
+    ├── offscreen.js                 # Audio capture, WebSocket/HTTP send, silence gate
+    └── pcm-worklet.js               # AudioWorklet: 1.5s PCM buffering + RMS
 ```
 
 ---
@@ -124,7 +138,7 @@ stt_plugin/
 - **Python 3.13**
 - **macOS** (Voxtral uses Apple MLX framework; Whisper works on any OS)
 - **Google Chrome** 116+ (Manifest V3, Offscreen Documents API)
-- ~4 GB free memory for Voxtral (4-bit quantized); ~500 MB for Whisper medium
+- ~4 GB free memory for Voxtral (4-bit quantized); ~1.6 GB disk/cache for the default Hindi Whisper model
 
 ---
 
@@ -153,10 +167,25 @@ cd stt_plugin
 .venv/bin/python3 server.py
 ```
 
-### Whisper only (faster startup, ~500 MB RAM)
+### Whisper only (faster startup)
 
 ```bash
 LOAD_VOXTRAL=false .venv/bin/python3 server.py
+```
+
+### Whisper with auto language detection
+
+```bash
+WHISPER_LANGUAGE= LOAD_VOXTRAL=false .venv/bin/python3 server.py
+```
+
+### Whisper with a different model
+
+```bash
+WHISPER_MODEL=medium \
+WHISPER_LANGUAGE=en \
+LOAD_VOXTRAL=false \
+.venv/bin/python3 server.py
 ```
 
 ### Voxtral only (~4 GB RAM, Apple Silicon only)
@@ -178,11 +207,11 @@ curl http://localhost:8000/health
 # {"ok":true,"models":{"whisper":true,"voxtral":true}}
 ```
 
-> **Note:** Voxtral loads in ~5 seconds after the first run (model is cached by HuggingFace). Initial download is ~2.5 GB.
+> **Note:** The default Whisper model `collabora/faster-whisper-medium-hindi` downloads ~1.54 GB on first run. Voxtral downloads ~2.5 GB on first run; subsequent startups take ~5 s from cache.
 
 ---
 
-## Configuration
+## Server Configuration
 
 All settings are controlled via environment variables. No config files needed.
 
@@ -190,10 +219,11 @@ All settings are controlled via environment variables. No config files needed.
 |---|---|---|
 | `LOAD_WHISPER` | `true` | Load Whisper model on startup |
 | `LOAD_VOXTRAL` | `true` | Load Voxtral model on startup |
-| `WHISPER_MODEL` | `medium` | Whisper model size: `tiny` / `base` / `small` / `medium` / `large` |
+| `WHISPER_MODEL` | `collabora/faster-whisper-medium-hindi` | Whisper model ID or size (`medium`, `large-v3`, HuggingFace ID) |
+| `WHISPER_LANGUAGE` | `hi` | Language code (`hi`, `en`); set empty for auto-detect |
 | `COMPUTE_TYPE` | `float32` | Whisper compute type: `float32` / `int8` |
-| `BEAM_SIZE` | `1` | Whisper beam search width (higher = more accurate, slower) |
-| `VOXTRAL_MODEL` | `mlx-community/Voxtral-Mini-4B-Realtime-2602-4bit` | Voxtral model path (HuggingFace ID or local path) |
+| `BEAM_SIZE` | `1` | Whisper beam width (higher = more accurate, slower) |
+| `VOXTRAL_MODEL` | `mlx-community/Voxtral-Mini-4B-Realtime-2602-4bit` | Voxtral model path |
 | `MAX_TOKENS` | `4096` | Maximum tokens for Voxtral output |
 | `TEMPERATURE` | `0.0` | Voxtral sampling temperature (0 = deterministic) |
 | `RECORDINGS_DIR` | `./recordings` | Root directory for session audio and transcripts |
@@ -203,12 +233,13 @@ All settings are controlled via environment variables. No config files needed.
 | `PORT` | `8000` | FastAPI HTTP port |
 | `MCP_PORT` | `8001` | MCP SSE server port |
 | `CORS_ORIGINS` | `*` | Comma-separated allowed CORS origins |
-| `LOG_DIR` | `.` | Directory for rotating log files (daily rotation, 30 days) |
+| `LOG_DIR` | `.` | Directory for rotating log files (daily, 30 days) |
 
 **Example with multiple overrides:**
 
 ```bash
-WHISPER_MODEL=large \
+WHISPER_MODEL=medium \
+WHISPER_LANGUAGE=en \
 RECORDINGS_DIR=~/my-recordings \
 MERGE_INTERVAL_SECS=60 \
 LOG_DIR=~/logs \
@@ -225,31 +256,104 @@ LOG_DIR=~/logs \
 2. Enable **Developer mode** (toggle, top-right)
 3. Click **Load unpacked**
 4. Select the `waveline_extension/` folder
-5. The **Waveline** icon appears in your toolbar (pin it via the puzzle piece menu)
+5. The **Waveline** icon appears in your toolbar — pin it via the puzzle-piece menu
 
-### Usage
+### Quick start
 
-1. Make sure the backend server is running (`curl localhost:8000/health`)
+1. Confirm the backend is running: `curl localhost:8000/health`
 2. Open any tab with audio — YouTube, a meeting, a podcast
-3. Click the **Waveline** icon in the toolbar
-4. Select your model: **Whisper** (general purpose) or **Voxtral** (optimized for Apple Silicon)
-5. Optionally enable **Mic** to also capture your microphone
-6. Click **Record** — transcript lines appear in real time
-7. Click **Stop** — audio is merged and saved; transcript written to disk
-8. Use **Export** to download the transcript as a `.txt` file
+3. Click the **Waveline** icon
+4. Select your **model** and configure **Settings** if needed (see below)
+5. Click **Record** — transcript lines appear in real time
+6. Click **Stop** — the button stays disabled until all audio is uploaded, then re-enables
+7. Use **Export** to download the transcript as `.txt`
 
-### Popup UI
+---
+
+## Extension Settings Guide
+
+Open the **Settings** section at the bottom of the popup to access all options. Settings are saved automatically and apply to the next recording.
+
+---
+
+### Backend URL
+
+**Default:** `http://localhost:8000`
+
+The address of your running `server.py`. Change this if:
+- The server is on a different machine (e.g. `http://192.168.1.10:8000`)
+- You changed the `PORT` environment variable
+- You're routing through a reverse proxy
+
+After editing, click **Save** — the connection indicator updates immediately.
+
+---
+
+### Transport
+
+**Default:** `WebSocket (low latency, auto-fallback to HTTP)`
+
+Controls how audio chunks are sent to the server.
+
+| Option | When to use |
+|---|---|
+| **WebSocket** | Default. One persistent connection per session. Lowest latency — result arrives as soon as each chunk is transcribed. Automatically falls back to HTTP if the WebSocket connection fails. |
+| **HTTP only** | Use if you're behind a corporate proxy or nginx that doesn't support WebSocket upgrades. Also useful for debugging — HTTP requests are visible in Chrome DevTools → Network. |
+
+> **Tip:** If you see frequent reconnection attempts in the server logs (`WS session=... closed with error`), switch to HTTP only.
+
+---
+
+### Include Microphone
+
+**Default:** off
+
+When enabled, your microphone audio is mixed with the tab audio before transcription. Useful for:
+- In-person meetings where you speak and others are on-screen
+- Dictating notes while a video plays
+
+Chrome will prompt for microphone permission the first time this is enabled. If you deny it, recording continues with tab audio only.
+
+---
+
+### Silence Gate
+
+**Default:** `0.003` — Range: `0.000` to `0.020`
+
+Controls the RMS (volume) threshold below which a chunk is considered silence and **not sent to the server**. The current value is shown next to the slider label.
+
+| Value | Effect |
+|---|---|
+| `0.000` | Gate off — every chunk is sent, including silence |
+| `0.003` | Default — skips near-silent periods (background hum, idle mic) |
+| `0.008–0.012` | Aggressive — only sends clearly audible speech; good for noisy rooms |
+| `0.020` | Maximum — may skip quiet speech; not recommended |
+
+**When to raise it:**
+- Server logs show many empty-text transcription results
+- You're in a noisy environment and silent chunks are slowing down the queue
+
+**When to lower it:**
+- Soft-spoken audio is being skipped
+- You notice gaps in the transcript that correspond to quieter speech
+
+---
+
+### Popup UI reference
 
 | Element | Description |
 |---|---|
-| **Record / Stop** | Start or stop a recording session |
-| **Mic toggle** | Mix microphone audio with tab audio |
-| **Model selector** | Choose Whisper or Voxtral (disabled during recording) |
-| **Connection status** | Live indicator: Connected / Unreachable + loaded models |
-| **Transcript area** | Live transcript; editable; persists across popup close/reopen |
-| **Export** | Download transcript as `.txt` |
-| **Clear** | Clear transcript from UI and storage |
-| **Settings** | Configure backend URL (default: `http://localhost:8000`) |
+| **Record** | Start a new recording session. Disabled while the previous session is still draining. |
+| **Stop** | Stop recording. Shows "Finishing…" while remaining chunks upload; re-enables Record when complete. |
+| **Model selector** | Choose Whisper or Voxtral. Disabled during recording. Unavailable models are greyed out. |
+| **Connection status** | Live indicator — Connected / Unreachable — updates on URL save and popup open. |
+| **Transcript area** | Live transcript; editable; persists across popup close/reopen. |
+| **Export** | Download transcript as `.txt`. |
+| **Clear** | Clear transcript from UI and local storage. |
+| **Settings › Backend URL** | Server address with save + live connection check. |
+| **Settings › Transport** | WebSocket (default) or HTTP only. |
+| **Settings › Include microphone** | Mix mic audio into the recording. |
+| **Settings › Silence gate** | RMS threshold slider for skipping silent chunks. |
 
 ---
 
@@ -263,7 +367,7 @@ Start a new recording session.
 
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `model` | string | `whisper` | Model to use: `whisper` or `voxtral` |
+| `model` | string | `whisper` | `whisper` or `voxtral` |
 | `user_tag` | string | `""` | Optional identifier for multi-user setups |
 
 **Response:**
@@ -275,7 +379,7 @@ Start a new recording session.
 
 ### `POST /session/stop`
 
-Finalize a session: merges all audio chunks into `merged.wav` and writes `transcript.txt`.
+Finalize a session. Concurrently merges all audio chunks into `merged.wav` and writes `transcript.txt` in the IO thread pool.
 
 **Form fields:** `session_id` (string, required)
 
@@ -293,13 +397,13 @@ Finalize a session: merges all audio chunks into `merged.wav` and writes `transc
 
 ### `POST /transcribe`
 
-Upload a single audio chunk for transcription. **Idempotent** — sending the same `seq` twice returns the cached result.
+Upload a single audio chunk for transcription. **Idempotent** — sending the same `seq` twice returns the cached result without re-transcribing.
 
 **Form fields:**
 
 | Field | Type | Description |
 |---|---|---|
-| `session_id` | string | Session UUID from `/session/start` |
+| `session_id` | string | Session UUID |
 | `seq` | integer | Chunk sequence number (0-indexed, monotonic) |
 | `model` | string | `whisper` or `voxtral` |
 | `audio` | file | WAV audio chunk |
@@ -310,6 +414,21 @@ Upload a single audio chunk for transcription. **Idempotent** — sending the sa
 ```
 
 **Error codes:** `404` session not found · `409` session closed · `503` model not loaded · `413` file too large
+
+---
+
+### `WebSocket /ws/transcribe/{session_id}?model=whisper`
+
+Streaming transcription over a persistent WebSocket connection.
+
+**Client → server:** binary frame = 4-byte little-endian sequence number + WAV bytes
+
+**Server → client:** JSON frame per chunk
+```json
+{ "seq": 0, "text": "transcribed text here" }
+```
+
+The extension uses this automatically when Transport = WebSocket. Falls back to `POST /transcribe` if the connection fails.
 
 ---
 
@@ -326,7 +445,7 @@ Retrieve the full transcript in sequence order.
 
 ### `GET /audio/{session_id}`
 
-Download the merged WAV file for a session. Triggers an on-demand merge if not yet merged.
+Download the merged WAV file. Triggers an on-demand merge if not yet done.
 
 **Response:** `audio/wav` file download
 
@@ -338,7 +457,7 @@ Check server status and loaded models.
 
 **Response:**
 ```json
-{ "ok": true, "models": { "whisper": true, "voxtral": true } }
+{ "ok": true, "models": { "whisper": true, "voxtral": false } }
 ```
 
 Returns `503` if no models are loaded.
@@ -347,7 +466,7 @@ Returns `503` if no models are loaded.
 
 ## MCP Server
 
-The MCP server runs on port 8001 alongside FastAPI. It exposes session operations as tools for use with Claude Code and other MCP clients.
+Runs on port 8001 alongside FastAPI. Exposes session operations as tools for Claude Code and other MCP clients.
 
 ### Available Tools
 
@@ -377,117 +496,69 @@ Add to `~/.claude/settings.json`:
 
 ## Output Files
 
-Each recording session creates an isolated directory:
+Each session creates an isolated directory:
 
 ```
 recordings/
 └── {session_id}/              # UUID, e.g. c7ea4cdf-dd2a-499b-bff2-1c7b2a27e8b7
     ├── chunks/
-    │   ├── chunk_00000.wav    # 4-second PCM WAV, 16kHz mono 16-bit
+    │   ├── chunk_00000.wav    # 1.5-second PCM WAV, 16kHz mono 16-bit
     │   ├── chunk_00001.wav
     │   └── ...
-    ├── merged.wav             # All chunks merged in sequence order
+    ├── merged.wav             # All chunks merged in sequence order (incremental append)
     └── transcript.txt         # Full transcript, one chunk per line
 ```
 
 - Chunks are saved immediately on receipt — audio is preserved even if transcription fails
-- `merged.wav` is created using Python's stdlib `wave` module — no ffmpeg dependency
-- Multiple concurrent sessions never share directories — safe for team use
+- `merged.wav` is built incrementally — only new chunks are appended each merge cycle, not rewritten from scratch
+- Merge and transcript write run concurrently in a background thread pool
+- `merged.wav` uses Python's stdlib `wave` module — no ffmpeg dependency
+- Multiple concurrent sessions never share directories
 
 ---
 
 ## Zero-Loss Design
 
-The original system silently dropped audio chunks on any network or server error. The redesigned system guarantees no silent data loss:
+### Silence gate (client-side)
 
-### Plugin-side retry queue
+The AudioWorklet computes the RMS of each 1.5-second chunk. If RMS < threshold, the chunk is discarded before any network I/O — no server round trip, no wasted inference.
+
+### Send queue with WebSocket + HTTP fallback
 
 ```
-chunk ready
+chunk ready (RMS ≥ threshold)
     │
     ▼
-enqueue(seq, blob)  ←──────────────────────┐
-    │                                       │
-    ▼                                       │
-processQueue() [every 500ms]                │
-    │                                       │
-    ├─ send to /transcribe ──► success ──► remove from queue
-    │                                       │
-    └─► failure ──► retries < 10 ──────────┘
-                        │
-                    retries = 10
-                        │
-                        ▼
-                  mark DEAD, notify popup
-                  (never silently dropped)
+WebSocket open?
+    ├─ yes → send binary frame → result JSON back immediately → done
+    │
+    └─ no  → HTTP queue (up to 4 parallel sends)
+                 │
+                 ├─ success → remove from queue
+                 │
+                 └─ failure → retry with backoff (500ms → 1s → 2s → … → 16s max)
+                                   │
+                               retries = 8
+                                   │
+                                   ▼
+                             mark DEAD, notify popup
+                             (never silently dropped)
 ```
 
-**Retry schedule:** 1s → 2s → 4s → 8s → … → 30s (max), exponential backoff
+### Drain before close
 
-**Drain before close:** when Stop is clicked, the audio worklet flushes its partial buffer, then the queue fully drains before `POST /session/stop` is called. The brittle 800ms timeout from the original design is gone.
+When Stop is clicked:
+1. AudioWorklet flushes its partial buffer
+2. The send queue (HTTP path) fully drains
+3. WebSocket sends a close frame so the server can flush
+4. Service worker calls `POST /session/stop`
+5. Popup Start button re-enables
 
-**Idempotent server:** each chunk carries a `seq` number. If a chunk is retried after a successful server write (e.g. the network response was lost), the server returns the cached result without re-transcribing.
+The Start button is disabled during this window — a new recording cannot begin until the previous session is committed.
 
-**Crash recovery:** on unexpected page close, the pending queue metadata is serialized to `chrome.storage.local` for inspection on next open.
+### Idempotent server
 
----
-
-## Tests Performed
-
-All tests were run against `server.py` using the `.venv` Python environment.
-
-### 1. Health check
-
-```bash
-curl http://localhost:8000/health
-# {"ok":true,"models":{"whisper":true,"voxtral":true}}
-```
-✅ Both models loaded and reported correctly.
-
-### 2. Whisper — end-to-end session
-
-- Created session with `model=whisper`
-- Sent a 2-second 440Hz sine wave WAV as a dummy audio chunk (`seq=0`)
-- Retrieved transcript (empty — no speech, correct)
-- Called `/session/stop`
-- Verified `merged.wav` and `transcript.txt` written to `recordings/{session_id}/`
-
-✅ Session lifecycle, audio saving, and file merge all working.
-
-### 3. Voxtral — end-to-end session
-
-Same test as above with `model=voxtral`.
-
-✅ Voxtral loaded and processed chunk correctly (~5s startup from cache).
-
-### 4. Idempotency (retry simulation)
-
-- Sent the same chunk twice with identical `seq=0`
-- Verified second response returned cached text without re-transcribing
-
-✅ Idempotent — safe for plugin retry queue.
-
-### 5. Audio download endpoint
-
-- Called `GET /audio/{session_id}` after session stop
-- Verified HTTP 200, `Content-Type: audio/wav`, correct byte size (64 044 bytes for 2s mono 16kHz)
-
-✅ Audio download working.
-
-### 6. MCP server startup
-
-- Started server with both models
-- Confirmed MCP server started on port 8001
-- Confirmed FastAPI running on port 8000 simultaneously
-
-✅ Both servers co-exist in the same process.
-
-### 7. Multi-session isolation
-
-- Started two sessions back-to-back
-- Verified each got a unique UUID and separate `recordings/` directory
-
-✅ Sessions fully isolated.
+Each chunk carries a `seq` number. If a chunk is retried after a successful server write (e.g. the network response was lost), the server returns the cached result without re-transcribing or re-saving.
 
 ---
 
@@ -499,14 +570,15 @@ Same test as above with `model=voxtral`.
 | **Tab audio requires user gesture** | Chrome's `tabCapture` API requires the extension popup to be opened by a real click — cannot be automated via CDP |
 | **No authentication** | Server accepts all requests; intended for local/team use behind a firewall |
 | **In-memory session store** | Sessions are lost on server restart; recordings on disk remain intact |
-| **English only (Whisper)** | `language="en"` is hardcoded for Whisper; Voxtral is multilingual |
+| **Whisper language is fixed per server process** | Change `WHISPER_LANGUAGE` and restart the server to switch; set it empty for auto-detect |
 | **MCP port conflict** | If port 8001 is in use, MCP server fails silently; FastAPI still runs |
+| **WebSocket behind proxies** | Some corporate proxies strip the `Upgrade` header — use Transport = HTTP only in that case |
 
 ---
 
 ## Legacy Servers
 
-`app.py` and `server_voxtral_sst_v2.py` are kept for backward compatibility but are superseded by `server.py`.
+`app.py` and `server_voxtral_sst_v2.py` are kept for reference but superseded by `server.py`.
 
 | File | Model | Sessions | Audio saving | MCP |
 |---|---|---|---|---|

@@ -72,7 +72,12 @@ chrome.runtime.onMessage.addListener((msg) => {
     deadWarningText.textContent = `Chunk #${msg.seq} permanently failed — gap in transcript.`;
     deadWarning.style.display = 'flex';
   }
+  if (msg.type === 'QUEUE_DRAINED') {
+    startBtn.disabled = false;
+    setStatus('');
+  }
   if (msg.type === 'SESSION_LOST') {
+    startBtn.disabled = false;
     setUI(false);
     setStatus('Server restarted — session lost. Start a new recording.', 'error');
   }
@@ -80,14 +85,50 @@ chrome.runtime.onMessage.addListener((msg) => {
 
 // ── Server URL settings ───────────────────────────────────────────────────────
 
-const serverUrlEl = document.getElementById('serverUrl');
-const saveUrlBtn  = document.getElementById('saveUrlBtn');
-const urlStatusEl = document.getElementById('urlStatus');
-const DEFAULT_URL = 'http://localhost:8000';
+const serverUrlEl        = document.getElementById('serverUrl');
+const saveUrlBtn         = document.getElementById('saveUrlBtn');
+const urlStatusEl        = document.getElementById('urlStatus');
+const transportSelectEl  = document.getElementById('transportSelect');
+const micToggleEl        = document.getElementById('micToggle');
+const silenceThresholdEl = document.getElementById('silenceThreshold');
+const silenceValEl       = document.getElementById('silenceThresholdVal');
+const languageEl         = document.getElementById('languageInput');
+const DEFAULT_URL        = 'http://localhost:8000';
 
-chrome.storage.local.get(['waveline_server_url'], (res) => {
+chrome.storage.local.get(['waveline_server_url', 'waveline_include_mic', 'waveline_silence_threshold', 'waveline_transport', 'waveline_language'], (res) => {
   serverUrlEl.value = res.waveline_server_url || DEFAULT_URL;
+  if (transportSelectEl) transportSelectEl.value = res.waveline_transport || 'ws';
+  if (micToggleEl) micToggleEl.checked = !!res.waveline_include_mic;
+  const thresh = res.waveline_silence_threshold ?? 0.003;
+  if (silenceThresholdEl) { silenceThresholdEl.value = thresh; silenceValEl.textContent = thresh; }
+  if (languageEl) languageEl.value = res.waveline_language || '';
 });
+
+if (transportSelectEl) {
+  transportSelectEl.addEventListener('change', () => {
+    chrome.storage.local.set({ waveline_transport: transportSelectEl.value });
+  });
+}
+
+if (languageEl) {
+  languageEl.addEventListener('change', () => {
+    chrome.storage.local.set({ waveline_language: languageEl.value.trim().toLowerCase() });
+  });
+}
+
+if (micToggleEl) {
+  micToggleEl.addEventListener('change', () => {
+    chrome.storage.local.set({ waveline_include_mic: micToggleEl.checked });
+  });
+}
+
+if (silenceThresholdEl) {
+  silenceThresholdEl.addEventListener('input', () => {
+    const v = parseFloat(silenceThresholdEl.value);
+    silenceValEl.textContent = v.toFixed(3);
+    chrome.storage.local.set({ waveline_silence_threshold: v });
+  });
+}
 
 saveUrlBtn.addEventListener('click', () => {
   const raw = serverUrlEl.value.trim().replace(/\/$/, '');
@@ -136,6 +177,10 @@ async function checkConnection(baseUrl) {
       const loaded = Object.entries(models).filter(([, v]) => v).map(([k]) => k).join(' · ');
       connText.textContent = loaded ? `Connected · ${loaded}` : 'Connected';
       connStatus.className = 'conn-badge conn-ok';
+      // Show server default language as placeholder on the language input
+      if (languageEl && data.defaults?.whisper_language) {
+        languageEl.placeholder = `server default: ${data.defaults.whisper_language}`;
+      }
     } else {
       connText.textContent = 'Server error';
       connStatus.className = 'conn-badge conn-warn';
@@ -163,22 +208,32 @@ startBtn.addEventListener('click', async () => {
   if (deadWarning) deadWarning.style.display = 'none';
   setStatus('Starting…');
   const model = modelSelect ? modelSelect.value : 'whisper';
-  chrome.runtime.sendMessage(
-    { type: 'START_RECORDING', model },
-    (res) => {
-      if (res?.error) {
-        setStatus('Error: ' + res.error, 'error');
-      } else {
-        setUI(true);
-        setStatus('');
+  chrome.storage.local.get(['waveline_include_mic', 'waveline_silence_threshold', 'waveline_transport', 'waveline_language'], (prefs) => {
+    chrome.runtime.sendMessage(
+      {
+        type: 'START_RECORDING',
+        model,
+        includeMic: !!prefs.waveline_include_mic,
+        silenceThreshold: prefs.waveline_silence_threshold ?? 0.003,
+        transport: prefs.waveline_transport || 'ws',
+        language: prefs.waveline_language || '',  // '' = use server default
+      },
+      (res) => {
+        if (res?.error) {
+          setStatus('Error: ' + res.error, 'error');
+        } else {
+          setUI(true);
+          setStatus('');
+        }
       }
-    }
-  );
+    );
+  });
 });
 
 stopBtn.addEventListener('click', () => {
   setUI(false);
-  setStatus('');
+  setStatus('Finishing…');
+  startBtn.disabled = true; // block re-start until drain completes
   chrome.runtime.sendMessage({ type: 'STOP_RECORDING' }).catch(() => {});
 });
 

@@ -494,6 +494,32 @@ textarea:focus {
     min-height: 14px;
 }
 
+.toggle-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    cursor: pointer;
+}
+
+.field-hint {
+    font-size: 10px;
+    font-weight: 600;
+    color: var(--accent);
+    font-family: var(--mono);
+    margin-left: 6px;
+}
+
+.field-hint-text {
+    font-size: 10px;
+    color: var(--muted);
+    margin: 0;
+}
+
+input[type="range"] {
+    width: 100%;
+    accent-color: var(--accent);
+}
+
 /* ── Scrollbar ── */
 textarea::-webkit-scrollbar { width: 4px; }
 textarea::-webkit-scrollbar-track { background: transparent; }
