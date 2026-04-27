@@ -514,7 +514,7 @@ async def ws_transcribe(websocket: WebSocket, session_id: str, model: str = "whi
 
     # Max chunks queued for transcription at once. Beyond this, audio is saved
     # to disk (for merge) but transcription is skipped — prevents unbounded drain.
-    MAX_PENDING = 6
+    MAX_PENDING = 10
     pending: set[asyncio.Task] = set()
 
     try:
