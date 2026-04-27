@@ -520,6 +520,9 @@ async def ws_transcribe(websocket: WebSocket, session_id: str, model: str = "whi
     try:
         while True:
             raw = await websocket.receive_bytes()
+            if len(raw) == 0:
+                # Zero-byte sentinel: client is done sending, break to drain
+                break
             if len(raw) < 5:
                 continue
 

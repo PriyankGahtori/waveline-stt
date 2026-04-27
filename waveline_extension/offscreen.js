@@ -264,15 +264,14 @@ async function initCapture(streamId, includeMic) {
     }
     if (e.data?.type === 'flushed') {
       draining = true;
-      if (sendQueue.size === 0 && !wsHasPending()) {
+      if (wsReady && ws?.readyState === WebSocket.OPEN) {
+        // Signal server we're done sending — server will drain pending tasks and close
+        // Do NOT close WS here: drain transcripts come back on this same connection
+        ws.send(new Uint8Array(0)); // zero-byte sentinel = client done sending
+      } else if (sendQueue.size === 0) {
         onFullyDrained();
       } else if (!queueLoopRunning && sendQueue.size > 0) {
         startQueueLoop();
-      }
-      // If WS path is used and has pending, wait for ws.onclose or explicit drain signal
-      if (wsReady) {
-        // Send a close frame so server knows to flush
-        try { ws?.close(1000, 'done'); } catch {}
       }
     }
   };
