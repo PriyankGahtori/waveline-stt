@@ -54,8 +54,10 @@ _ch.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s", date
 
 logger = logging.getLogger("stt_server")
 logger.setLevel(logging.INFO)
-logger.addHandler(_fh)
-logger.addHandler(_ch)
+# Guard against duplicate handlers when uvicorn forks/reloads the module
+if not logger.handlers:
+    logger.addHandler(_fh)
+    logger.addHandler(_ch)
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -86,7 +88,8 @@ def _load_models():
         try:
             from faster_whisper import WhisperModel
             logger.info("Loading Whisper model: %s language=%s", _WHISPER_MODEL, _WHISPER_LANGUAGE or "auto")
-            models["whisper"] = WhisperModel(_WHISPER_MODEL, compute_type=_COMPUTE_TYPE)
+            cpu_threads = int(os.getenv("WHISPER_CPU_THREADS", "8"))
+            models["whisper"] = WhisperModel(_WHISPER_MODEL, compute_type=_COMPUTE_TYPE, cpu_threads=cpu_threads, num_workers=1)
             logger.info("Whisper ready")
         except Exception as e:
             logger.error("Failed to load Whisper: %s", e)
@@ -139,6 +142,9 @@ def _voxtral_subprocess(audio_path: str, voxtral_model_id: str, max_tokens: int,
 _voxtral_executor = concurrent.futures.ProcessPoolExecutor(max_workers=1)
 _io_executor = concurrent.futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix="stt-io")
 
+# Whisper is CPU-bound — one inference at a time prevents contention and thrashing
+_whisper_sem: asyncio.Semaphore  # initialised in lifespan (needs running loop)
+
 
 def _do_transcribe(audio_path: str, model_name: str, language: Optional[str] = None) -> str:
     if model_name == "whisper":
@@ -189,6 +195,7 @@ def _create_session(model_name: str, user_tag: str = "", language: Optional[str]
         "closed": False,
         "last_merged_chunk": -1,
         "user_tag": user_tag,
+        "ws_done": None,  # asyncio.Event set when WS handler finishes draining
     }
     logger.info("Session started: %s model=%s lang=%s user=%s", session_id, model_name, language or "server-default", user_tag)
     return session_id
@@ -293,7 +300,8 @@ async def _periodic_merge():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _merge_task
+    global _merge_task, _whisper_sem
+    _whisper_sem = asyncio.Semaphore(1)  # one Whisper inference at a time
     _RECORDINGS_DIR.mkdir(parents=True, exist_ok=True)
     _load_models()
     if _MERGE_INTERVAL_SECS > 0:
@@ -370,10 +378,20 @@ async def session_stop(session_id: str = Form(...)):
         }
 
     s["closed"] = True
+
+    # Wait for the WS handler to finish draining all in-flight transcriptions
+    # before writing the transcript so it's complete, not partial.
+    ws_done: Optional[asyncio.Event] = s.get("ws_done")
+    if ws_done is not None:
+        try:
+            await asyncio.wait_for(ws_done.wait(), timeout=60)
+        except asyncio.TimeoutError:
+            logger.warning("Session %s WS drain timed out after 60s — writing partial transcript", session_id)
+
     chunk_count = len(s["chunks"])
     logger.info("Session stopped: %s chunks=%d — running merge+transcript in background", session_id, chunk_count)
 
-    # Run merge + transcript write concurrently, non-blocking
+    # Run merge + transcript write concurrently in IO thread pool
     merged, transcript = await _merge_and_write_async(session_id)
 
     return {
@@ -460,6 +478,45 @@ async def ws_transcribe(websocket: WebSocket, session_id: str, model: str = "whi
     loop = asyncio.get_event_loop()
     tmp_dir = s["audio_dir"]
 
+    # Register a done-event so session/stop can wait for full drain
+    ws_done = asyncio.Event()
+    s["ws_done"] = ws_done
+
+    # One Whisper inference at a time — CPU-bound, concurrency causes thrashing
+    # Chunks queue up behind the semaphore and are processed in arrival order
+    async def _transcribe_chunk(seq: int, wav_bytes: bytes):
+        chunk_path = tmp_dir / f"chunk_{seq:05d}.wav"
+        chunk_path.write_bytes(wav_bytes)
+        try:
+            lang = s.get("language")
+            async with _whisper_sem:
+                if model == "voxtral":
+                    future = _voxtral_executor.submit(
+                        _voxtral_subprocess, str(chunk_path), _VOXTRAL_MODEL, _MAX_TOKENS, _TEMPERATURE
+                    )
+                    text = await loop.run_in_executor(None, future.result)
+                else:
+                    text = await loop.run_in_executor(None, _do_transcribe, str(chunk_path), model, lang)
+        except Exception as exc:
+            logger.exception("WS transcription failed session=%s seq=%d: %s", session_id, seq, exc)
+            chunk_path.unlink(missing_ok=True)
+            try:
+                await websocket.send_json({"seq": seq, "text": "", "error": "transcription failed"})
+            except Exception:
+                pass
+            return
+        s["chunks"][seq] = text
+        logger.info("WS transcribed session=%s seq=%d chars=%d", session_id, seq, len(text))
+        try:
+            await websocket.send_json({"seq": seq, "text": text})
+        except Exception:
+            pass  # WS may already be closed — result is still stored in s["chunks"]
+
+    # Max chunks queued for transcription at once. Beyond this, audio is saved
+    # to disk (for merge) but transcription is skipped — prevents unbounded drain.
+    MAX_PENDING = 6
+    pending: set[asyncio.Task] = set()
+
     try:
         while True:
             raw = await websocket.receive_bytes()
@@ -477,32 +534,27 @@ async def ws_transcribe(websocket: WebSocket, session_id: str, model: str = "whi
                 await websocket.send_json({"seq": seq, "text": s["chunks"][seq]})
                 continue
 
-            chunk_path = tmp_dir / f"chunk_{seq:05d}.wav"
-            chunk_path.write_bytes(wav_bytes)
-
-            try:
-                lang = s.get("language")
-                if model == "voxtral":
-                    future = _voxtral_executor.submit(
-                        _voxtral_subprocess, str(chunk_path), _VOXTRAL_MODEL, _MAX_TOKENS, _TEMPERATURE
-                    )
-                    text = await loop.run_in_executor(None, future.result)
-                else:
-                    text = await loop.run_in_executor(None, _do_transcribe, str(chunk_path), model, lang)
-            except Exception as exc:
-                logger.exception("WS transcription failed session=%s seq=%d: %s", session_id, seq, exc)
-                chunk_path.unlink(missing_ok=True)
-                await websocket.send_json({"seq": seq, "text": "", "error": "transcription failed"})
+            if len(pending) >= MAX_PENDING:
+                # Queue is full — save audio for merge but skip transcription
+                chunk_path = tmp_dir / f"chunk_{seq:05d}.wav"
+                chunk_path.write_bytes(wav_bytes)
+                logger.warning("WS session=%s seq=%d skipped transcription (queue full)", session_id, seq)
                 continue
 
-            s["chunks"][seq] = text
-            logger.info("WS transcribed session=%s seq=%d chars=%d", session_id, seq, len(text))
-            await websocket.send_json({"seq": seq, "text": text})
+            task = asyncio.create_task(_transcribe_chunk(seq, wav_bytes))
+            pending.add(task)
+            task.add_done_callback(pending.discard)
 
     except WebSocketDisconnect:
         pass
     except Exception as exc:
         logger.warning("WS session=%s closed with error: %s", session_id, exc)
+    finally:
+        if pending:
+            logger.info("WS session=%s draining %d queued chunks…", session_id, len(pending))
+            await asyncio.gather(*pending, return_exceptions=True)
+        ws_done.set()  # unblock session/stop so transcript is written after full drain
+        logger.info("WS session=%s fully drained", session_id)
 
 
 @app.get("/transcript/{session_id}")

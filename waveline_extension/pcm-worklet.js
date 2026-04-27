@@ -2,7 +2,7 @@ class PcmCaptureProcessor extends AudioWorkletProcessor {
   constructor(options) {
     super();
     const opts = options?.processorOptions || {};
-    this.chunkFrames = opts.chunkFrames || 16000 * 1.5; // 1.5s default (was 4s)
+    this.chunkFrames = opts.chunkFrames || 16000 * 4; // 4s default
     this.silenceThreshold = opts.silenceThreshold ?? 0.002; // RMS below this = silence
     this.buf = new Float32Array(this.chunkFrames);
     this.wrote = 0;

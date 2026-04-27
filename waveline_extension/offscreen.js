@@ -252,7 +252,7 @@ async function initCapture(streamId, includeMic) {
 
   workletNode = new AudioWorkletNode(audioCtx, 'pcm-capture', {
     processorOptions: {
-      chunkFrames: 16000 * 1.5, // 1.5s chunks (was 4s)
+      chunkFrames: 16000 * 4, // 4s chunks — matches Voxtral's ~3.5s inference time
       silenceThreshold: SILENCE_RMS_THRESHOLD,
     },
   });
