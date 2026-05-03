@@ -5,6 +5,7 @@ __pycache__/
 .venv/
 venv/
 *.egg-info/
+.env
 
 # Recordings & runtime data
 recordings/

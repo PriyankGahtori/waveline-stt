@@ -155,28 +155,31 @@ cd stt_plugin
 .venv/bin/pip install -r requirements.txt
 ```
 
-`requirements.txt` installs: `fastapi`, `uvicorn`, `faster-whisper`, `mlx-audio`, `mcp[cli]`, `python-multipart`.
+`requirements.txt` installs: `fastapi`, `uvicorn`, `faster-whisper`, `mlx-audio`, `mlx-whisper`, `mcp[cli]`, `python-multipart`.
 
 ---
 
 ## Running the Server
 
-### Both models (recommended)
+### Default models from `.env`
 
 ```bash
 .venv/bin/python3 server.py
 ```
 
+The server loads `.env` from the same directory as `server.py`. Shell environment variables override values from `.env`.
+For a new checkout, copy `.env.example` to `.env` and edit the model flags there.
+
 ### Whisper only (faster startup)
 
 ```bash
-LOAD_VOXTRAL=false .venv/bin/python3 server.py
+LOAD_VOXTRAL=false LOAD_VAANI=false .venv/bin/python3 server.py
 ```
 
 ### Whisper with auto language detection
 
 ```bash
-WHISPER_LANGUAGE= LOAD_VOXTRAL=false .venv/bin/python3 server.py
+WHISPER_LANGUAGE= LOAD_VOXTRAL=false LOAD_VAANI=false .venv/bin/python3 server.py
 ```
 
 ### Whisper with a different model
@@ -185,13 +188,20 @@ WHISPER_LANGUAGE= LOAD_VOXTRAL=false .venv/bin/python3 server.py
 WHISPER_MODEL=medium \
 WHISPER_LANGUAGE=en \
 LOAD_VOXTRAL=false \
+LOAD_VAANI=false \
 .venv/bin/python3 server.py
 ```
 
 ### Voxtral only (~4 GB RAM, Apple Silicon only)
 
 ```bash
-LOAD_WHISPER=false .venv/bin/python3 server.py
+LOAD_WHISPER=false LOAD_VAANI=false .venv/bin/python3 server.py
+```
+
+### Vaani only (Hindi, Apple Silicon only)
+
+```bash
+LOAD_WHISPER=false LOAD_VOXTRAL=false .venv/bin/python3 server.py
 ```
 
 ### With audio merge interval
@@ -204,7 +214,7 @@ MERGE_INTERVAL_SECS=30 .venv/bin/python3 server.py
 
 ```bash
 curl http://localhost:8000/health
-# {"ok":true,"models":{"whisper":true,"voxtral":true}}
+# {"ok":true,"models":{"whisper":true,"voxtral":true,"vaani":true}}
 ```
 
 > **Note:** The default Whisper model `collabora/faster-whisper-medium-hindi` downloads ~1.54 GB on first run. Voxtral downloads ~2.5 GB on first run; subsequent startups take ~5 s from cache.
@@ -213,17 +223,19 @@ curl http://localhost:8000/health
 
 ## Server Configuration
 
-All settings are controlled via environment variables. No config files needed.
+Settings are read from a root `.env` file first, then from shell environment variables. Shell values take precedence.
 
 | Variable | Default | Description |
 |---|---|---|
 | `LOAD_WHISPER` | `true` | Load Whisper model on startup |
 | `LOAD_VOXTRAL` | `true` | Load Voxtral model on startup |
+| `LOAD_VAANI` | `true` | Load Vaani model on startup |
 | `WHISPER_MODEL` | `collabora/faster-whisper-medium-hindi` | Whisper model ID or size (`medium`, `large-v3`, HuggingFace ID) |
 | `WHISPER_LANGUAGE` | `hi` | Language code (`hi`, `en`); set empty for auto-detect |
 | `COMPUTE_TYPE` | `float32` | Whisper compute type: `float32` / `int8` |
 | `BEAM_SIZE` | `1` | Whisper beam width (higher = more accurate, slower) |
 | `VOXTRAL_MODEL` | `mlx-community/Voxtral-Mini-4B-Realtime-2602-4bit` | Voxtral model path |
+| `VAANI_MODEL` | `ARTPARK-IISc/whisper-medium-vaani-hindi` | Vaani model path |
 | `MAX_TOKENS` | `4096` | Maximum tokens for Voxtral output |
 | `TEMPERATURE` | `0.0` | Voxtral sampling temperature (0 = deterministic) |
 | `RECORDINGS_DIR` | `./recordings` | Root directory for session audio and transcripts |

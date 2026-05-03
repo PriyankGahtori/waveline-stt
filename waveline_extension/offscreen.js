@@ -20,6 +20,9 @@ let wsReady = false;
 let wsReconnectTimer = null;
 const WS_MAX_RECONNECT_MS = 8000;
 let wsReconnectDelay = 500;
+const wsInFlight = new Map();
+const wsSendPromises = new Set();
+let wsDrainComplete = false;
 
 // Silence gate — configurable from popup settings, default 0.003
 let SILENCE_RMS_THRESHOLD = 0.003;
@@ -56,10 +59,21 @@ function connectWs() {
     ws.onmessage = (ev) => {
       try {
         const data = JSON.parse(ev.data);
+        if (data.type === 'drained') {
+          wsDrainComplete = true;
+          wsInFlight.clear();
+          if (sendQueue.size === 0 && wsInFlight.size === 0) onFullyDrained();
+          else if (!queueLoopRunning) startQueueLoop();
+          return;
+        }
         if (data.text) {
           chrome.runtime.sendMessage({ type: 'TRANSCRIPT_LINE', line: data.text.trim() });
         }
+        if (data.error && data.seq !== undefined) {
+          chrome.runtime.sendMessage({ type: 'CHUNK_DEAD', seq: data.seq });
+        }
         if (data.seq !== undefined) {
+          wsInFlight.delete(data.seq);
           sendQueue.delete(data.seq); // ack
         }
       } catch {}
@@ -70,9 +84,13 @@ function connectWs() {
     ws.onclose = () => {
       wsReady = false;
       ws = null;
+      queueUnackedWsChunksForHttp();
       if (!draining && sessionId) {
         wsReconnectDelay = Math.min(wsReconnectDelay * 2, WS_MAX_RECONNECT_MS);
         wsReconnectTimer = setTimeout(connectWs, wsReconnectDelay);
+      } else if (draining) {
+        wsDrainComplete = true;
+        if (sendQueue.size === 0) onFullyDrained();
       }
     };
   } catch {
@@ -87,6 +105,17 @@ function closeWs() {
   ws = null;
 }
 
+function queueUnackedWsChunksForHttp() {
+  if (wsInFlight.size === 0) return;
+  for (const [seq, entry] of wsInFlight) {
+    if (!sendQueue.has(seq)) {
+      sendQueue.set(seq, { blob: entry.blob, retries: 0, nextRetryAt: 0 });
+    }
+  }
+  wsInFlight.clear();
+  if (sendQueue.size > 0 && !queueLoopRunning) startQueueLoop();
+}
+
 // ── Chunk dispatch ────────────────────────────────────────────────────────────
 
 function enqueueChunk(blob, rms) {
@@ -97,19 +126,33 @@ function enqueueChunk(blob, rms) {
 
   // Try WebSocket first (lowest latency)
   if (wsReady && ws?.readyState === WebSocket.OPEN) {
+    let sendPromise;
     const reader = new FileReader();
+    sendPromise = new Promise((resolve) => {
+      reader.onloadend = resolve;
+      reader.onerror = () => {
+        enqueueHttpFallback(seq, blob);
+        resolve();
+      };
+    });
+    wsSendPromises.add(sendPromise);
+    sendPromise.finally(() => wsSendPromises.delete(sendPromise));
     reader.onload = () => {
       if (ws?.readyState === WebSocket.OPEN) {
-        // Send seq as 4-byte header + wav bytes
-        const wavBytes = new Uint8Array(reader.result);
-        const pkt = new Uint8Array(4 + wavBytes.length);
-        new DataView(pkt.buffer).setUint32(0, seq, true);
-        pkt.set(wavBytes, 4);
-        ws.send(pkt.buffer);
+        try {
+          // Send seq as 4-byte header + wav bytes
+          const wavBytes = new Uint8Array(reader.result);
+          const pkt = new Uint8Array(4 + wavBytes.length);
+          new DataView(pkt.buffer).setUint32(0, seq, true);
+          pkt.set(wavBytes, 4);
+          wsInFlight.set(seq, { blob });
+          ws.send(pkt.buffer);
+        } catch {
+          wsInFlight.delete(seq);
+          enqueueHttpFallback(seq, blob);
+        }
       } else {
-        // WS closed mid-send — fall back to HTTP
-        sendQueue.set(seq, { blob, retries: 0, nextRetryAt: 0 });
-        if (!queueLoopRunning) startQueueLoop();
+        enqueueHttpFallback(seq, blob);
       }
     };
     reader.readAsArrayBuffer(blob);
@@ -117,6 +160,10 @@ function enqueueChunk(blob, rms) {
   }
 
   // HTTP fallback
+  enqueueHttpFallback(seq, blob);
+}
+
+function enqueueHttpFallback(seq, blob) {
   sendQueue.set(seq, { blob, retries: 0, nextRetryAt: 0 });
   if (!queueLoopRunning) startQueueLoop();
 }
@@ -141,13 +188,24 @@ async function processQueue() {
       await Promise.all(eligible.map(([seq, entry]) => trySend(seq, entry)));
     }
 
-    if (draining && sendQueue.size === 0) {
+    if (draining && wsDrainComplete && sendQueue.size === 0 && wsInFlight.size === 0) {
       queueLoopRunning = false;
       onFullyDrained();
       return;
     }
 
+    if (!draining && sendQueue.size === 0) {
+      queueLoopRunning = false;
+      return;
+    }
+
     await sleep(QUEUE_INTERVAL_MS);
+  }
+}
+
+async function waitForPendingWsSends() {
+  while (wsSendPromises.size > 0) {
+    await Promise.allSettled(Array.from(wsSendPromises));
   }
 }
 
@@ -189,6 +247,10 @@ function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 // ── Drain + cleanup ───────────────────────────────────────────────────────────
 
 function onFullyDrained() {
+  if (!sessionId) return;
+  sessionId = null;
+  draining = false;
+  wsInFlight.clear();
   closeWs();
   cleanup();
   chrome.runtime.sendMessage({ type: 'QUEUE_DRAINED' });
@@ -203,6 +265,12 @@ chrome.runtime.onMessage.addListener((msg, _sender) => {
     serverUrl = msg.serverUrl || serverUrl;
     sessionId = msg.sessionId;
     sessionModel = msg.model || 'whisper';
+    seqCounter = 0;
+    draining = false;
+    wsDrainComplete = false;
+    sendQueue.clear();
+    wsInFlight.clear();
+    wsSendPromises.clear();
     if (typeof msg.silenceThreshold === 'number') SILENCE_RMS_THRESHOLD = msg.silenceThreshold;
     useWebSocket = msg.transport !== 'http';
     connectWs();
@@ -263,16 +331,7 @@ async function initCapture(streamId, includeMic) {
       enqueueChunk(wavBlob, e.data.rms ?? 1);
     }
     if (e.data?.type === 'flushed') {
-      draining = true;
-      if (wsReady && ws?.readyState === WebSocket.OPEN) {
-        // Signal server we're done sending — server will drain pending tasks and close
-        // Do NOT close WS here: drain transcripts come back on this same connection
-        ws.send(new Uint8Array(0)); // zero-byte sentinel = client done sending
-      } else if (sendQueue.size === 0) {
-        onFullyDrained();
-      } else if (!queueLoopRunning && sendQueue.size > 0) {
-        startQueueLoop();
-      }
+      finishDrain();
     }
   };
 
@@ -283,10 +342,20 @@ async function initCapture(streamId, includeMic) {
   audioEl.play().catch(() => {});
 }
 
-function wsHasPending() {
-  // We don't track individual WS sends, so conservatively return false
-  // The WS onclose handler or HTTP fallback covers the remainder
-  return false;
+async function finishDrain() {
+  draining = true;
+  await waitForPendingWsSends();
+  if (wsReady && ws?.readyState === WebSocket.OPEN) {
+    // Signal server we're done sending; the server replies with {type:"drained"}.
+    ws.send(new Uint8Array(0));
+  } else {
+    wsDrainComplete = true;
+    if (sendQueue.size === 0) {
+      onFullyDrained();
+    } else if (!queueLoopRunning) {
+      startQueueLoop();
+    }
+  }
 }
 
 // ── Stop ──────────────────────────────────────────────────────────────────────
