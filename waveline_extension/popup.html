@@ -49,6 +49,7 @@
                     <option value="whisper">Whisper</option>
                     <option value="voxtral">Voxtral</option>
                     <option value="vaani">Vaani (Hindi)</option>
+                    <option value="nemotron">Nemotron 3.5</option>
                 </select>
                 <button id="startBtn" class="btn btn-record">
                     <span class="rec-circle"></span>
@@ -128,11 +129,11 @@
                 </div>
                 <p id="urlStatus" class="url-status"></p>
 
-                <label for="languageInput" class="field-label">Whisper language</label>
+                <label for="languageInput" class="field-label">Language</label>
                 <input type="text" id="languageInput" placeholder="server default: hi"
                        spellcheck="false" maxlength="10"
                        style="padding:6px 9px;font-size:12px;font-family:var(--mono);background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:var(--radius-sm);outline:none;width:100%;box-sizing:border-box;" />
-                <p class="field-hint-text">Language code: <code>hi</code>, <code>en</code>, <code>zh</code>… or <code>auto</code> for detection. Empty = use server default.</p>
+                <p class="field-hint-text">Whisper/Vaani use codes like <code>hi</code> or <code>en</code>. Nemotron uses locales like <code>hi-IN</code>, <code>en-US</code>, or <code>auto</code>. Empty = server default.</p>
 
                 <label for="transportSelect" class="field-label">Transport</label>
                 <select id="transportSelect" class="model-select">

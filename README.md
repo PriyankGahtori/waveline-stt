@@ -31,7 +31,7 @@
 - **Silence gate** — silent audio chunks are detected client-side and never sent, reducing latency and server load
 - **1.5-second chunks** — transcription starts 1.5 s after speech, down from 4 s
 - **Zero data loss** — retry queue with exponential backoff; chunks are never silently dropped
-- **Dual model support** — switch between OpenAI Whisper and Mistral Voxtral from the extension popup
+- **Multi-model support** — switch between Whisper, Voxtral, Vaani, and Nemotron 3.5 from the extension popup
 - **Session management** — each recording is isolated under a UUID; safe for concurrent multi-user use
 - **Audio file saving** — every chunk saved as WAV; merged incrementally into a single file (only new chunks appended each time)
 - **Transcript persistence** — full transcript written to disk in chronological order on session stop
@@ -81,6 +81,8 @@
 │  │   whisper)   │  │ • merged_path│  │ • get_audio_path         │   │
 │  │ • Voxtral    │  │ • closed     │  │ • set_model              │   │
 │  │   (mlx-audio)│  │              │  │                          │   │
+│  │ • Nemotron   │  │              │  │                          │   │
+│  │   (HF RNNT)  │  │              │  │                          │   │
 │  └──────────────┘  └──────────────┘  └──────────────────────────┘   │
 │                                                                       │
 │  IO thread pool (4 threads) — merge + transcript write off-loop      │
@@ -195,13 +197,32 @@ LOAD_VAANI=false \
 ### Voxtral only (~4 GB RAM, Apple Silicon only)
 
 ```bash
-LOAD_WHISPER=false LOAD_VAANI=false .venv/bin/python3 server.py
+LOAD_WHISPER=false LOAD_VAANI=false LOAD_NEMOTRON=false .venv/bin/python3 server.py
 ```
 
 ### Vaani only (Hindi, Apple Silicon only)
 
 ```bash
-LOAD_WHISPER=false LOAD_VOXTRAL=false .venv/bin/python3 server.py
+LOAD_WHISPER=false LOAD_VOXTRAL=false LOAD_NEMOTRON=false .venv/bin/python3 server.py
+```
+
+### Nemotron 3.5 only (PyTorch, works on CPU/CUDA/MPS, ~1.7 GB)
+
+```bash
+LOAD_WHISPER=false LOAD_VOXTRAL=false LOAD_VAANI=false \
+LOAD_NEMOTRON=true \
+NEMOTRON_LANGUAGE=hi-IN \
+.venv/bin/python3 server.py
+```
+
+### Nemotron with English and GPU
+
+```bash
+LOAD_WHISPER=false LOAD_VOXTRAL=false LOAD_VAANI=false \
+LOAD_NEMOTRON=true \
+NEMOTRON_LANGUAGE=en-US \
+NEMOTRON_DEVICE=cuda \
+.venv/bin/python3 server.py
 ```
 
 ### With audio merge interval
@@ -230,12 +251,16 @@ Settings are read from a root `.env` file first, then from shell environment var
 | `LOAD_WHISPER` | `true` | Load Whisper model on startup |
 | `LOAD_VOXTRAL` | `true` | Load Voxtral model on startup |
 | `LOAD_VAANI` | `true` | Load Vaani model on startup |
+| `LOAD_NEMOTRON` | `false` | Load Nemotron 3.5 ASR model on startup |
 | `WHISPER_MODEL` | `collabora/faster-whisper-medium-hindi` | Whisper model ID or size (`medium`, `large-v3`, HuggingFace ID) |
 | `WHISPER_LANGUAGE` | `hi` | Language code (`hi`, `en`); set empty for auto-detect |
 | `COMPUTE_TYPE` | `float32` | Whisper compute type: `float32` / `int8` |
 | `BEAM_SIZE` | `1` | Whisper beam width (higher = more accurate, slower) |
 | `VOXTRAL_MODEL` | `mlx-community/Voxtral-Mini-4B-Realtime-2602-4bit` | Voxtral model path |
 | `VAANI_MODEL` | `ARTPARK-IISc/whisper-medium-vaani-hindi` | Vaani model path |
+| `NEMOTRON_MODEL` | `nvidia/nemotron-3.5-asr-streaming-0.6b` | Nemotron HuggingFace model ID |
+| `NEMOTRON_LANGUAGE` | `hi-IN` | Nemotron locale (`hi-IN`, `en-US`, `auto`, etc.) |
+| `NEMOTRON_DEVICE` | `auto` | Torch device (`auto`, `cpu`, `cuda`, `mps`) |
 | `MAX_TOKENS` | `4096` | Maximum tokens for Voxtral output |
 | `TEMPERATURE` | `0.0` | Voxtral sampling temperature (0 = deterministic) |
 | `RECORDINGS_DIR` | `./recordings` | Root directory for session audio and transcripts |
@@ -579,6 +604,7 @@ Each chunk carries a `seq` number. If a chunk is retried after a successful serv
 | Limitation | Notes |
 |---|---|
 | **Voxtral: Apple Silicon only** | MLX framework requires Apple M-series hardware |
+| **Nemotron: CPU on Apple Silicon** | MPS backend is available but `float32` inference is slow; `NEMOTRON_DEVICE=cpu` may be faster on M-series Mac |
 | **Tab audio requires user gesture** | Chrome's `tabCapture` API requires the extension popup to be opened by a real click — cannot be automated via CDP |
 | **No authentication** | Server accepts all requests; intended for local/team use behind a firewall |
 | **In-memory session store** | Sessions are lost on server restart; recordings on disk remain intact |
@@ -594,6 +620,6 @@ Each chunk carries a `seq` number. If a chunk is retried after a successful serv
 
 | File | Model | Sessions | Audio saving | MCP |
 |---|---|---|---|---|
-| `server.py` | Whisper + Voxtral | ✅ | ✅ | ✅ |
+| `server.py` | Whisper + Voxtral + Vaani + Nemotron | ✅ | ✅ | ✅ |
 | `app.py` | Whisper only | ✗ | ✗ | ✗ |
 | `server_voxtral_sst_v2.py` | Voxtral only | ✗ | ✗ | ✗ |

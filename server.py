@@ -5,12 +5,20 @@ Environment variables:
   LOAD_WHISPER       true|false  (default: true)
   LOAD_VOXTRAL       true|false  (default: true)
   LOAD_VAANI         true|false  (default: true)
+  LOAD_NEMOTRON      true|false  (default: false)
+  NEMOTRON_BACKEND   auto|parakeet|transformers (default: auto)
   WHISPER_MODEL      model id/size (default: collabora/faster-whisper-medium-hindi)
   WHISPER_LANGUAGE   language code; empty = auto-detect (default: hi)
   COMPUTE_TYPE       float32     (default: float32)
   BEAM_SIZE          int         (default: 1)
   VOXTRAL_MODEL      model path  (default: mlx-community/Voxtral-Mini-4B-Realtime-2602-4bit)
   VAANI_MODEL        model path  (default: ARTPARK-IISc/whisper-medium-vaani-hindi)
+  NEMOTRON_MODEL     transformers model id (default: nvidia/nemotron-3.5-asr-streaming-0.6b)
+  NEMOTRON_PARKEET_MODEL parakeet.cpp model id/path (default: nemotron-3.5-asr-streaming-0.6b)
+  NEMOTRON_LANGUAGE  locale or auto (default: hi-IN)
+  NEMOTRON_DEVICE    auto|cpu|cuda|mps (default: auto)
+  NEMOTRON_BIN       parakeet.cpp executable (default: parakeet-cli)
+  NEMOTRON_CMD       optional custom command template for parakeet execution
   MAX_TOKENS         int         (default: 4096)
   TEMPERATURE        float       (default: 0.0)
   RECORDINGS_DIR     path        (default: ./recordings)
@@ -29,6 +37,9 @@ import importlib
 import logging
 import logging.handlers
 import os
+import shlex
+import subprocess
+import shutil
 import time
 import uuid
 import wave
@@ -94,12 +105,27 @@ if not logger.handlers:
 _LOAD_WHISPER = os.getenv("LOAD_WHISPER", "true").lower() == "true"
 _LOAD_VOXTRAL = os.getenv("LOAD_VOXTRAL", "true").lower() == "true"
 _LOAD_VAANI = os.getenv("LOAD_VAANI", "true").lower() == "true"
+_LOAD_NEMOTRON = os.getenv("LOAD_NEMOTRON", "false").lower() == "true"
+_NEMOTRON_BACKEND = os.getenv("NEMOTRON_BACKEND", "auto").strip().lower()
 _WHISPER_MODEL = os.getenv("WHISPER_MODEL", "collabora/faster-whisper-medium-hindi")
 _WHISPER_LANGUAGE = os.getenv("WHISPER_LANGUAGE", "hi").strip() or None
 _COMPUTE_TYPE = os.getenv("COMPUTE_TYPE", "float32")
 _BEAM_SIZE = int(os.getenv("BEAM_SIZE", "1"))
 _VOXTRAL_MODEL = os.getenv("VOXTRAL_MODEL", "mlx-community/Voxtral-Mini-4B-Realtime-2602-4bit")
 _VAANI_MODEL = os.getenv("VAANI_MODEL", "ARTPARK-IISc/whisper-medium-vaani-hindi")
+_NEMOTRON_MODEL = os.getenv("NEMOTRON_MODEL", "nvidia/nemotron-3.5-asr-streaming-0.6b")
+_NEMOTRON_PARKEET_MODEL = os.getenv("NEMOTRON_PARKEET_MODEL", "nemotron-3.5-asr-streaming-0.6b").strip()
+_NEMOTRON_LANGUAGE = os.getenv("NEMOTRON_LANGUAGE", "hi-IN").strip() or "auto"
+_NEMOTRON_DEVICE = os.getenv("NEMOTRON_DEVICE", "auto").strip().lower()
+_NEMOTRON_BIN = os.getenv("NEMOTRON_BIN", "").strip()
+_NEMOTRON_BIN_CANDIDATES = [
+    _NEMOTRON_BIN,
+    "/private/tmp/parakeet.cpp/build/examples/cli/parakeet-cli",
+    "/private/tmp/parakeet.cpp/build/examples/cli/parakeet",
+    "parakeet-cli",
+    "parakeet",
+]
+_NEMOTRON_CMD = os.getenv("NEMOTRON_CMD", "").strip()
 _MAX_TOKENS = int(os.getenv("MAX_TOKENS", "4096"))
 _TEMPERATURE = float(os.getenv("TEMPERATURE", "0.0"))
 _RECORDINGS_DIR = Path(os.getenv("RECORDINGS_DIR", "./recordings"))
@@ -112,9 +138,9 @@ _CORS_ORIGINS = os.getenv("CORS_ORIGINS", "*").split(",")
 
 # ── Model registry ────────────────────────────────────────────────────────────
 
-VALID_MODELS = ("whisper", "voxtral", "vaani")
-MODEL_ERROR = "model must be 'whisper', 'voxtral', or 'vaani'"
-models: dict = {"whisper": None, "voxtral": None, "vaani": None}
+VALID_MODELS = ("whisper", "voxtral", "vaani", "nemotron")
+MODEL_ERROR = "model must be 'whisper', 'voxtral', 'vaani', or 'nemotron'"
+models: dict = {"whisper": None, "voxtral": None, "vaani": None, "nemotron": None}
 
 
 def _is_valid_model(model_name: str) -> bool:
@@ -164,6 +190,18 @@ def _get_io_executor() -> concurrent.futures.ThreadPoolExecutor:
     return _io_executor
 
 
+def _select_torch_device(device_name: str):
+    import torch
+
+    if device_name == "auto":
+        if torch.cuda.is_available():
+            return torch.device("cuda")
+        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            return torch.device("mps")
+        return torch.device("cpu")
+    return torch.device(device_name)
+
+
 def _load_models():
     if _LOAD_WHISPER:
         try:
@@ -193,6 +231,57 @@ def _load_models():
             logger.info("Vaani ready")
         except Exception as e:
             logger.error("Failed to load Vaani: %s", e)
+
+    if _LOAD_NEMOTRON:
+        try:
+            parakeet_bin = _resolve_nemotron_bin()
+            use_parakeet = _NEMOTRON_BACKEND == "parakeet" or (
+                _NEMOTRON_BACKEND == "auto" and parakeet_bin is not None
+            )
+            if use_parakeet:
+                logger.info(
+                    "Loading Nemotron via parakeet.cpp: model=%s language=%s bin=%s",
+                    _NEMOTRON_PARKEET_MODEL,
+                    _NEMOTRON_LANGUAGE,
+                    parakeet_bin or _NEMOTRON_BIN,
+                )
+                models["nemotron"] = {
+                    "backend": "parakeet",
+                    "bin": parakeet_bin or _NEMOTRON_BIN,
+                    "cmd": _NEMOTRON_CMD,
+                    "model": _NEMOTRON_PARKEET_MODEL,
+                }
+                logger.info("Nemotron ready")
+            else:
+                if _NEMOTRON_BACKEND == "parakeet":
+                    raise FileNotFoundError(
+                        "Nemotron backend set to parakeet, but no parakeet.cpp binary was found"
+                    )
+                import torch
+                from transformers import AutoModelForRNNT, AutoProcessor
+
+                device = _select_torch_device(_NEMOTRON_DEVICE)
+                logger.info("Loading Nemotron ASR model: %s language=%s device=%s", _NEMOTRON_MODEL, _NEMOTRON_LANGUAGE, device)
+                processor = AutoProcessor.from_pretrained(_NEMOTRON_MODEL)
+                model = AutoModelForRNNT.from_pretrained(_NEMOTRON_MODEL)
+                model.to(device)
+                model.eval()
+                models["nemotron"] = {"processor": processor, "model": model, "torch": torch, "backend": "transformers"}
+                logger.info("Nemotron ready")
+        except Exception as e:
+            logger.error("Failed to load Nemotron: %s", e)
+
+
+def _resolve_nemotron_bin() -> Optional[str]:
+    for candidate in _NEMOTRON_BIN_CANDIDATES:
+        if not candidate:
+            continue
+        if os.path.isabs(candidate) and os.path.exists(candidate):
+            return candidate
+        found = shutil.which(candidate)
+        if found:
+            return found
+    return None
 
 
 def _transcribe_whisper(audio_path: str, language: Optional[str] = None) -> str:
@@ -230,6 +319,126 @@ def _transcribe_vaani(audio_path: str, language: Optional[str] = None) -> str:
         _vaani_subprocess, audio_path, _VAANI_MODEL, effective_language
     )
     return future.result()
+
+
+def _read_wav_mono_float32(audio_path: str, target_rate: int):
+    import numpy as np
+
+    with wave.open(audio_path, "rb") as wav_file:
+        sample_rate = wav_file.getframerate()
+        channels = wav_file.getnchannels()
+        sample_width = wav_file.getsampwidth()
+        frames = wav_file.readframes(wav_file.getnframes())
+
+    if sample_width == 2:
+        audio = np.frombuffer(frames, dtype="<i2").astype(np.float32) / 32768.0
+    elif sample_width == 4:
+        audio = np.frombuffer(frames, dtype="<i4").astype(np.float32) / 2147483648.0
+    else:
+        raise ValueError(f"Unsupported WAV sample width: {sample_width}")
+
+    if channels > 1:
+        audio = audio.reshape(-1, channels).mean(axis=1)
+
+    if sample_rate != target_rate and audio.size > 0:
+        duration = audio.size / sample_rate
+        new_size = max(1, int(round(duration * target_rate)))
+        old_x = np.linspace(0.0, duration, num=audio.size, endpoint=False)
+        new_x = np.linspace(0.0, duration, num=new_size, endpoint=False)
+        audio = np.interp(new_x, old_x, audio).astype(np.float32)
+
+    return audio.astype(np.float32, copy=False)
+
+
+def _transcribe_nemotron(audio_path: str, language: Optional[str] = None) -> str:
+    bundle = models["nemotron"]
+    if bundle is None:
+        raise RuntimeError("Nemotron model is not loaded")
+    if bundle.get("backend") == "parakeet":
+        future = _get_io_executor().submit(
+            _nemotron_subprocess, audio_path, bundle["model"], bundle["bin"], bundle["cmd"], language
+        )
+        return future.result()
+
+    processor = bundle["processor"]
+    model = bundle["model"]
+    torch = bundle["torch"]
+    sampling_rate = processor.feature_extractor.sampling_rate
+    audio = _read_wav_mono_float32(audio_path, sampling_rate)
+
+    effective_language = language if language is not None else _NEMOTRON_LANGUAGE
+    if effective_language == "":
+        effective_language = "auto"
+
+    inputs = processor(
+        audio,
+        sampling_rate=sampling_rate,
+        language=effective_language,
+        return_tensors="pt",
+    )
+    # Move tensors to the correct device; only cast float tensors to model.dtype
+    # (integer/bool tensors like attention_mask must not be cast)
+    device = model.device
+    dtype = model.dtype
+    inputs = {
+        k: (v.to(device=device, dtype=dtype) if v.is_floating_point() else v.to(device=device))
+        for k, v in inputs.items()
+    }
+    with torch.inference_mode():
+        output = model.generate(**inputs, return_dict_in_generate=True)
+    # output.sequences is a 2D tensor [batch, tokens]; batch_decode handles it correctly
+    results = processor.batch_decode(output.sequences, skip_special_tokens=True)
+    return results[0].strip() if results else ""
+
+
+def _nemotron_subprocess(audio_path: str, model_id: str, binary: str, command_template: str, language: Optional[str]) -> str:
+    """Run parakeet.cpp as an external CLI and return stdout as transcript text."""
+    effective_language = language if language is not None else _NEMOTRON_LANGUAGE
+    if effective_language == "":
+        effective_language = "auto"
+
+    if command_template:
+        command = command_template.format(
+            binary=binary,
+            audio_path=audio_path,
+            model=model_id,
+            language=effective_language,
+        )
+        argv = shlex.split(command)
+    else:
+        argv = [
+            binary,
+            "transcribe",
+            "--model",
+            model_id,
+            "--input",
+            audio_path,
+            "--lang",
+            effective_language,
+            "--json",
+        ]
+
+    logger.info("Running Nemotron subprocess: %s", " ".join(shlex.quote(part) for part in argv))
+    completed = subprocess.run(argv, check=True, capture_output=True, text=True)
+    stdout = completed.stdout.strip()
+    stderr = completed.stderr.strip()
+    if stderr:
+        logger.info("Nemotron stderr: %s", stderr)
+    if not stdout:
+        return ""
+
+    if not stdout:
+        return ""
+    if stdout.startswith("{"):
+        try:
+            import json
+            payload = json.loads(stdout)
+            if isinstance(payload, dict) and "text" in payload:
+                return str(payload["text"]).strip()
+        except Exception:
+            pass
+    lines = [line.strip() for line in stdout.splitlines() if line.strip()]
+    return lines[-1] if lines else ""
 
 
 # Top-level function for subprocess execution (MLX is not thread-safe; must run
@@ -377,8 +586,9 @@ def _vaani_subprocess(audio_path: str, model_id: str, language: Optional[str]) -
         raise
 
 
-# Whisper is CPU-bound — one inference at a time prevents contention and thrashing
+# Heavy model inference is serialized per backend to prevent contention and thrashing
 _whisper_sem: asyncio.Semaphore  # initialised in lifespan (needs running loop)
+_nemotron_sem: asyncio.Semaphore  # initialised in lifespan (needs running loop)
 
 
 def _do_transcribe(audio_path: str, model_name: str, language: Optional[str] = None) -> str:
@@ -391,6 +601,8 @@ def _do_transcribe(audio_path: str, model_name: str, language: Optional[str] = N
         return future.result()
     elif model_name == "vaani":
         return _transcribe_vaani(audio_path, language=language)
+    elif model_name == "nemotron":
+        return _transcribe_nemotron(audio_path, language=language)
     raise ValueError(f"Unknown model: {model_name}")
 
 
@@ -538,8 +750,9 @@ async def _periodic_merge():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _merge_task, _whisper_sem, _voxtral_executor, _vaani_executor, _io_executor
+    global _merge_task, _whisper_sem, _nemotron_sem, _voxtral_executor, _vaani_executor, _io_executor
     _whisper_sem = asyncio.Semaphore(1)  # one Whisper inference at a time
+    _nemotron_sem = asyncio.Semaphore(1)  # one Nemotron inference at a time
     _RECORDINGS_DIR.mkdir(parents=True, exist_ok=True)
     _load_models()
     if _MERGE_INTERVAL_SECS > 0:
@@ -692,6 +905,9 @@ async def transcribe(
                 _voxtral_subprocess, str(chunk_path), _VOXTRAL_MODEL, _MAX_TOKENS, _TEMPERATURE
             )
             text = await loop.run_in_executor(None, future.result)
+        elif model == "nemotron":
+            async with _nemotron_sem:
+                text = await loop.run_in_executor(None, _do_transcribe, str(chunk_path), model, lang)
         else:
             text = await loop.run_in_executor(None, _do_transcribe, str(chunk_path), model, lang)
     except Exception as exc:
@@ -747,6 +963,9 @@ async def ws_transcribe(websocket: WebSocket, session_id: str, model: str = "whi
                 text = await loop.run_in_executor(None, future.result)
             elif model == "vaani":
                 text = await loop.run_in_executor(None, _transcribe_vaani, str(chunk_path), lang)
+            elif model == "nemotron":
+                async with _nemotron_sem:
+                    text = await loop.run_in_executor(None, _do_transcribe, str(chunk_path), model, lang)
             else:
                 async with _whisper_sem:
                     text = await loop.run_in_executor(None, _do_transcribe, str(chunk_path), model, lang)
@@ -849,6 +1068,9 @@ async def health():
             "whisper_model": _WHISPER_MODEL,
             "voxtral_model": _VOXTRAL_MODEL,
             "vaani_model": _VAANI_MODEL,
+            "nemotron_model": _NEMOTRON_MODEL,
+            "nemotron_backend": _NEMOTRON_BACKEND,
+            "nemotron_language": _NEMOTRON_LANGUAGE,
         },
     }
 
@@ -915,7 +1137,7 @@ def _setup_mcp():
 
     @mcp.tool()
     def set_model(session_id: str, model: str) -> dict:
-        """Switch the STT model for an active session (whisper, voxtral, or vaani)."""
+        """Switch the STT model for an active session (whisper, voxtral, vaani, or nemotron)."""
         if not _is_valid_model(model):
             return {"error": MODEL_ERROR}
         try:
